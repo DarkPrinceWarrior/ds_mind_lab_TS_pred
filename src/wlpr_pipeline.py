@@ -1,0 +1,1177 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Type
+
+import numpy as np
+import pandas as pd
+from neuralforecast import NeuralForecast
+from neuralforecast.models.tsmixerx import TSMixerx
+from neuralforecast.losses.pytorch import HuberLoss, MAE, MAPE, MSE, SMAPE
+import torch
+from torch.optim import Adam, AdamW, Optimizer, SGD
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LRScheduler,
+    OneCycleLR,
+    ReduceLROnPlateau,
+    StepLR,
+)
+
+EPSILON = 1e-6
+logger = logging.getLogger(__name__)
+
+LOSS_REGISTRY: Dict[str, type] = {
+    "mae": MAE,
+    "mse": MSE,
+    "smape": SMAPE,
+    "mape": MAPE,
+    "huber": HuberLoss,
+}
+
+OPTIMIZER_REGISTRY: Dict[str, Type[Optimizer]] = {
+    "adam": Adam,
+    "adamw": AdamW,
+    "sgd": SGD,
+}
+
+SCHEDULER_REGISTRY: Dict[str, Type[LRScheduler]] = {
+    "onecycle": OneCycleLR,
+    "steplr": StepLR,
+    "cosine": CosineAnnealingLR,
+    "reducelronplateau": ReduceLROnPlateau,
+}
+
+
+@dataclass
+class PipelineConfig:
+    horizon: int = 6
+    val_horizon: int = 6
+    freq: str = "MS"
+    min_history: int = 60
+    input_size: int = 48
+    n_block: int = 2
+    ff_dim: int = 64
+    dropout: float = 0.1
+    learning_rate: float = 5e-4
+    max_steps: int = 250
+    early_stop_patience_steps: int = 50
+    val_check_steps: int = 20
+    batch_size: int = 16
+    windows_batch_size: int = 64
+    scaler_type: str = "standard"
+    num_lr_decays: int = 2
+    random_seed: int = 42
+    cv_folds: int = 6
+    cv_step: int = 6
+    cv_enabled: bool = True
+    grad_clip_norm: Optional[float] = 1.0
+    grad_clip_value: Optional[float] = None
+    loss: str = "huber"
+    valid_loss: Optional[str] = "smape"
+    weight_decay: float = 1e-4
+    exclude_insample_y: bool = False
+    revin: bool = True
+    valid_batch_size: Optional[int] = 32
+    inference_windows_batch_size: Optional[int] = 64
+    start_padding_enabled: bool = False
+    training_data_availability_threshold: float | List[float] = 0.1
+    step_size: int = 1
+    drop_last_loader: bool = False
+    optimizer_name: Optional[str] = "adamw"
+    optimizer_kwargs: Dict[str, Any] = field(default_factory=lambda: {"betas": (0.9, 0.99)})
+    lr_scheduler_name: Optional[str] = "onecycle"
+    lr_scheduler_kwargs: Dict[str, Any] = field(default_factory=lambda: {"pct_start": 0.3, "div_factor": 10.0})
+    dataloader_kwargs: Dict[str, Any] = field(default_factory=lambda: {"num_workers": 0, "pin_memory": False})
+    trainer_kwargs: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "accelerator": "gpu" if torch.cuda.is_available() else "auto",
+            "devices": 1,
+            "precision": "16-mixed" if torch.cuda.is_available() else 32,
+            "log_every_n_steps": 10,
+            "gradient_clip_val": 1.0,
+            "enable_model_summary": False,
+        }
+    )
+    hist_exog: List[str] = field(
+        default_factory=lambda: [
+            "wlpt",
+            "womt",
+            "womr",
+            "wwir",
+            "wwit",
+            "wthp",
+            "wbhp",
+            "wlpt_diff",
+            "womt_diff",
+            "wwit_diff",
+            "inj_wwir_weighted",
+            "inj_wwir_weighted_lag1",
+            "inj_wwir_weighted_lag3",
+            "inj_wwir_weighted_lag6",
+            "inj_wwir_weighted_roll3",
+            "inj_wwir_weighted_roll6",
+            "inj_wwit_diff_weighted",
+            "inj_wwit_diff_weighted_lag1",
+            "wwir_lag1",
+            "wwir_lag3",
+            "wwir_lag6",
+            "wwir_roll3",
+            "wwir_roll6",
+            "wwit_diff_lag1",
+        ]
+    )
+    futr_exog: List[str] = field(
+        default_factory=lambda: [
+            "month_sin",
+            "month_cos",
+            "time_idx",
+            "type_prod",
+            "type_inj",
+            "inj_wwir_weighted",
+            "inj_wwir_weighted_lag1",
+            "inj_wwir_weighted_lag3",
+            "inj_wwir_weighted_lag6",
+            "inj_wwir_weighted_roll3",
+            "inj_wwir_weighted_roll6",
+            "inj_wwit_diff_weighted",
+            "inj_wwit_diff_weighted_lag1",
+            "wwir_lag1",
+            "wwir_lag3",
+            "wwir_lag6",
+            "wwir_roll3",
+            "wwir_roll6",
+            "wwit_diff_lag1",
+        ]
+    )
+    static_exog: List[str] = field(default_factory=lambda: ["x", "y", "z"])
+
+
+def load_raw_data(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path, sep=";")
+    df = df.rename(columns={"DATA": "date", "TYPE": "type"})
+    df.columns = [col.lower() for col in df.columns]
+    df = df.dropna(how="all")
+    df = df[df["date"].notna() & df["well"].notna()]
+    df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+    df = df[df["date"].notna()]
+    df["well"] = df["well"].astype(float).astype(int).astype(str)
+    if "type" in df.columns:
+        df["type"] = df["type"].astype(str).str.strip().str.upper()
+    unnamed = [col for col in df.columns if col.startswith("unnamed")]
+    df = df.drop(columns=unnamed, errors="ignore")
+    numeric_cols = [col for col in df.columns if col not in {"date", "type", "well"}]
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+    df = df.sort_values(["well", "date"])
+    df = df.drop_duplicates(["well", "date"])
+    logger.info("Loaded %d rows for %d wells", len(df), df["well"].nunique())
+    return df
+
+
+def load_coordinates(path: Path) -> pd.DataFrame:
+    records: List[Tuple[str, float, float, float]] = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("--"):
+                continue
+            parts = line.replace("'", " ").split()
+            if len(parts) < 4:
+                continue
+            well = parts[0].strip()
+            x, y, z = map(float, parts[1:4])
+            records.append((well, x, y, z))
+    coords = pd.DataFrame(records, columns=["well", "x", "y", "z"])
+    coords["well"] = coords["well"].astype(str).str.strip()
+    logger.info("Loaded coordinates for %d wells", len(coords))
+    return coords
+
+
+def load_distance_matrix(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path, index_col=0)
+
+    def _normalize(label: object) -> str:
+        if pd.isna(label):
+            raise ValueError("Distance matrix contains unnamed wells.")
+        if isinstance(label, (int, np.integer)):
+            return str(int(label))
+        if isinstance(label, float) and float(label).is_integer():
+            return str(int(label))
+        return str(label).strip()
+
+    df.index = df.index.map(_normalize)
+    df.columns = df.columns.map(_normalize)
+    df = df.apply(pd.to_numeric, errors="coerce")
+    df = df.where(pd.notnull(df), np.nan)
+    df = df.sort_index().sort_index(axis=1)
+    logger.info(
+        "Loaded distance matrix with %d wells (rows) and %d wells (columns)",
+        df.shape[0],
+        df.shape[1],
+    )
+    return df
+
+
+def get_target_wells(df: pd.DataFrame, config: PipelineConfig) -> List[str]:
+    counts = df.groupby("well").size()
+    last_types = df.sort_values("date").groupby("well").tail(1).set_index("well")["type"]
+    required = config.horizon + config.val_horizon
+    selected: List[str] = []
+    for well, well_type in last_types.items():
+        if well_type != "PROD":
+            continue
+        if counts.get(well, 0) < max(required, config.min_history):
+            continue
+        selected.append(well)
+    logger.info("Selected %d producer wells for modeling", len(selected))
+    return sorted(selected)
+
+
+def reindex_series(df: pd.DataFrame, wells: List[str], freq: str) -> pd.DataFrame:
+    frames: List[pd.DataFrame] = []
+    for well in wells:
+        well_df = df[df["well"] == well].set_index("date").sort_index()
+        if well_df.empty:
+            continue
+        idx = pd.date_range(well_df.index.min(), well_df.index.max(), freq=freq)
+        well_df = well_df.reindex(idx)
+        well_df["well"] = well
+        frames.append(well_df.reset_index().rename(columns={"index": "ds"}))
+    if not frames:
+        return pd.DataFrame(columns=["ds", "well"])
+    return pd.concat(frames, ignore_index=True)
+
+
+def _zero_injection_features(date_index: pd.DatetimeIndex, wells: List[str]) -> pd.DataFrame:
+    if not wells or len(date_index) == 0:
+        return pd.DataFrame(columns=["ds", "well", "inj_wwir_weighted", "inj_wwit_diff_weighted"])
+    repeats = len(date_index)
+    tiles = len(wells)
+    return pd.DataFrame(
+        {
+            "ds": np.repeat(date_index.values, tiles),
+            "well": np.tile(wells, repeats),
+            "inj_wwir_weighted": 0.0,
+            "inj_wwit_diff_weighted": 0.0,
+        }
+    )
+
+
+def generate_walk_forward_splits(
+    train_df: pd.DataFrame,
+    horizon: int,
+    step: int,
+    folds: int,
+) -> List[Dict[str, pd.DataFrame]]:
+    if folds <= 0 or horizon <= 0 or step <= 0:
+        return []
+    if train_df.empty:
+        return []
+    per_well_max = train_df.groupby("unique_id")["time_idx"].max()
+    if per_well_max.empty:
+        return []
+    max_common_idx = int(per_well_max.min())
+    total_points = max_common_idx + 1
+    usable_prefix = total_points - horizon - step * (folds - 1)
+    if usable_prefix <= 0:
+        raise ValueError(
+            "Insufficient history for requested rolling-origin validation: "
+            f"total_points={total_points}, horizon={horizon}, step={step}, folds={folds}"
+        )
+    logger.info(
+        "Walk-forward CV layout: total_points=%d, base_train_len=%d, horizon=%d, step=%d, folds=%d",
+        total_points,
+        usable_prefix,
+        horizon,
+        step,
+        folds,
+    )
+    splits: List[Dict[str, pd.DataFrame]] = []
+    for fold_idx in range(folds):
+        train_cutoff = usable_prefix + step * fold_idx - 1
+        val_start = usable_prefix + step * fold_idx
+        val_end = val_start + horizon - 1
+        fold_train = (
+            train_df[train_df["time_idx"] <= train_cutoff]
+            .copy()
+            .sort_values(["unique_id", "ds"])
+        )
+        fold_val = (
+            train_df[
+                (train_df["time_idx"] >= val_start)
+                & (train_df["time_idx"] <= val_end)
+            ]
+            .copy()
+            .sort_values(["unique_id", "ds"])
+        )
+        if fold_train.empty or fold_val.empty:
+            logger.warning(
+                "Skipping fold %d due to empty train (%d rows) or val (%d rows)",
+                fold_idx + 1,
+                len(fold_train),
+                len(fold_val),
+            )
+            continue
+        splits.append(
+            {
+                "fold": fold_idx + 1,
+                "train_cutoff": train_cutoff,
+                "val_start": val_start,
+                "val_end": val_end,
+                "train_df": fold_train,
+                "val_df": fold_val,
+            }
+        )
+    return splits
+
+
+def run_walk_forward_validation(
+    train_df: pd.DataFrame,
+    static_df: pd.DataFrame,
+    config: PipelineConfig,
+) -> Optional[Dict[str, object]]:
+    if not config.cv_enabled:
+        return None
+    try:
+        splits = generate_walk_forward_splits(
+            train_df,
+            horizon=config.horizon,
+            step=config.cv_step,
+            folds=config.cv_folds,
+        )
+    except ValueError as exc:
+        logger.warning("Skipping walk-forward validation: %s", exc)
+        return None
+    if not splits:
+        logger.warning("Walk-forward validation requested but no splits were generated.")
+        return None
+    fold_results: List[Dict[str, object]] = []
+    metric_sums: Dict[str, float] = {}
+    metric_weights: Dict[str, float] = {}
+    futr_columns = ["unique_id", "ds"] + config.futr_exog
+    for split in splits:
+        model = _create_model(config, n_series=train_df["unique_id"].nunique())
+        nf = NeuralForecast(models=[model], freq=config.freq)
+        nf.fit(
+            df=split["train_df"],
+            static_df=static_df,
+            val_size=config.val_horizon,
+        )
+        fold_futr = split["val_df"][futr_columns].copy()
+        preds = nf.predict(futr_df=fold_futr, static_df=static_df)
+        preds = preds.rename(columns={"tsmixerx_wlpr": "y_hat"})
+        metrics, merged = evaluate_predictions(
+            preds,
+            split["val_df"],
+            split["train_df"],
+        )
+        overall_raw = metrics.get("overall", {})
+        overall: Dict[str, Optional[float]] = {}
+        for key, value in overall_raw.items():
+            if isinstance(value, (int, float, np.floating)) and np.isfinite(value):
+                overall[key] = float(value)
+            else:
+                overall[key] = None
+        rows = len(merged)
+        train_end_obs = int(split["train_cutoff"]) + 1
+        val_start_obs = int(split["val_start"]) + 1
+        val_end_obs = int(split["val_end"]) + 1
+        fold_results.append(
+            {
+                "fold": int(split["fold"]),
+                "train_span": [1, train_end_obs],
+                "val_span": [val_start_obs, val_end_obs],
+                "train_rows": int(len(split["train_df"])),
+                "rows": int(rows),
+                "indices": {
+                    "train_end_idx": int(split["train_cutoff"]),
+                    "val_start_idx": int(split["val_start"]),
+                    "val_end_idx": int(split["val_end"]),
+                },
+                "metrics": overall,
+            }
+        )
+        logger.info(
+            "Fold %d validation metrics: %s",
+            split["fold"],
+            {k: round(v, 4) if isinstance(v, (int, float, np.floating)) else v for k, v in overall.items()},
+        )
+        for key, value in overall.items():
+            if value is None:
+                continue
+            metric_sums[key] = metric_sums.get(key, 0.0) + value * rows
+            metric_weights[key] = metric_weights.get(key, 0.0) + rows
+    aggregate = {
+        key: float(metric_sums[key] / metric_weights[key])
+        for key in metric_sums
+        if metric_weights.get(key, 0.0) > 0.0
+    }
+    if aggregate:
+        logger.info(
+            "Walk-forward validation aggregate metrics: %s",
+            {k: round(v, 4) for k, v in aggregate.items()},
+        )
+    return {"folds": fold_results, "aggregate": aggregate}
+
+
+def build_injection_features(
+    raw_df: pd.DataFrame,
+    coords: pd.DataFrame,
+    prod_wells: List[str],
+    date_index: pd.DatetimeIndex,
+    distances: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    inj_df = raw_df[raw_df["type"] == "INJ"].copy()
+    if inj_df.empty or not prod_wells:
+        return _zero_injection_features(date_index, prod_wells)
+    inj_df = inj_df[["date", "well", "wwir", "wwit_diff"]].copy()
+    inj_df["well"] = inj_df["well"].astype(str)
+    inj_df = inj_df.dropna(subset=["date", "well"])
+    inj_df = inj_df.sort_values(["well", "date"])
+    inj_df = inj_df.drop_duplicates(["well", "date"])
+    if inj_df.empty:
+        return _zero_injection_features(date_index, prod_wells)
+    inj_wells = sorted(inj_df["well"].unique())
+    rate_wide = (
+        inj_df.pivot(index="date", columns="well", values="wwir")
+        .reindex(date_index)
+        .fillna(0.0)
+    )
+    diff_wide = (
+        inj_df.pivot(index="date", columns="well", values="wwit_diff")
+        .reindex(date_index)
+        .fillna(0.0)
+    )
+    rate_wide.index = rate_wide.index.rename("ds")
+    diff_wide.index = diff_wide.index.rename("ds")
+    coords_idx = coords.set_index("well")
+    missing_prod = [well for well in prod_wells if well not in coords_idx.index]
+    if missing_prod:
+        raise ValueError(f"Missing coordinates for producer wells: {missing_prod}")
+
+    distance_matrix = distances if distances is not None else None
+    if distance_matrix is not None:
+        missing_prod_in_matrix = [
+            well
+            for well in prod_wells
+            if well not in distance_matrix.index and well not in distance_matrix.columns
+        ]
+        missing_inj_in_matrix = [
+            well
+            for well in inj_wells
+            if well not in distance_matrix.index and well not in distance_matrix.columns
+        ]
+        if missing_prod_in_matrix:
+            logger.warning(
+                "Distance matrix missing producer wells %s. Falling back to coordinate distances.",
+                missing_prod_in_matrix,
+            )
+        if missing_inj_in_matrix:
+            logger.warning(
+                "Distance matrix missing injector wells %s. Falling back to coordinate distances.",
+                missing_inj_in_matrix,
+            )
+
+    def _lookup_distance(prod: str, inj: str) -> float:
+        if distance_matrix is not None:
+            value = np.nan
+            if prod in distance_matrix.index and inj in distance_matrix.columns:
+                value = distance_matrix.at[prod, inj]
+            elif inj in distance_matrix.index and prod in distance_matrix.columns:
+                value = distance_matrix.at[inj, prod]
+            if pd.notna(value):
+                return float(value)
+        if inj not in coords_idx.index:
+            raise ValueError(f"Missing coordinates for injector well {inj}")
+        prod_vec = coords_idx.loc[prod, ["x", "y", "z"]].to_numpy(dtype=float)
+        inj_vec = coords_idx.loc[inj, ["x", "y", "z"]].to_numpy(dtype=float)
+        return float(np.linalg.norm(prod_vec - inj_vec))
+
+    weight_rows: List[np.ndarray] = []
+    for prod in prod_wells:
+        weights: List[float] = []
+        for inj in inj_wells:
+            dist = _lookup_distance(prod, inj)
+            if dist <= 0.0:
+                weight = 1.0
+            else:
+                dist = max(dist, EPSILON)
+                weight = 1.0 / (dist ** 2)
+            weights.append(weight)
+        weights_arr = np.array(weights, dtype=float)
+        total = float(weights_arr.sum())
+        if not np.isfinite(total) or total <= 0.0:
+            weights_arr = np.full_like(weights_arr, 1.0 / len(weights_arr))
+        else:
+            weights_arr = weights_arr / total
+        weight_rows.append(weights_arr)
+    weight_matrix = np.vstack(weight_rows)  # (n_prod, n_inj)
+    weighted_rate = rate_wide.to_numpy() @ weight_matrix.T
+    weighted_diff = diff_wide.to_numpy() @ weight_matrix.T
+    rate_df = (
+        pd.DataFrame(weighted_rate, index=rate_wide.index, columns=prod_wells)
+        .stack()
+        .rename("inj_wwir_weighted")
+        .reset_index()
+    )
+    diff_df = (
+        pd.DataFrame(weighted_diff, index=diff_wide.index, columns=prod_wells)
+        .stack()
+        .rename("inj_wwit_diff_weighted")
+        .reset_index()
+    )
+    rate_df = rate_df.rename(columns={"level_1": "well"})
+    diff_df = diff_df.rename(columns={"level_1": "well"})
+    features = rate_df.merge(diff_df, on=["ds", "well"], how="left")
+    return features
+
+
+def add_lag_features(
+    df: pd.DataFrame, group_col: str, columns: List[str], lags: List[int]
+) -> List[str]:
+    new_columns: List[str] = []
+    for col in columns:
+        if col not in df.columns:
+            continue
+        for lag in lags:
+            new_col = f"{col}_lag{lag}"
+            df[new_col] = df.groupby(group_col)[col].shift(lag)
+            new_columns.append(new_col)
+    return new_columns
+
+
+def add_rolling_features(
+    df: pd.DataFrame, group_col: str, columns: List[str], windows: List[int]
+) -> List[str]:
+    new_columns: List[str] = []
+    for col in columns:
+        if col not in df.columns:
+            continue
+        for window in windows:
+            new_col = f"{col}_roll{window}"
+            df[new_col] = (
+                df.groupby(group_col)[col]
+                .transform(lambda series: series.rolling(window, min_periods=1).mean())
+            )
+            new_columns.append(new_col)
+    return new_columns
+
+
+def impute_numeric(df: pd.DataFrame, group_col: str, columns: List[str]) -> pd.DataFrame:
+    for col in columns:
+        if col not in df.columns:
+            continue
+        df[col] = df.groupby(group_col)[col].transform(lambda series: series.ffill().bfill())
+    df[columns] = df[columns].fillna(0.0)
+    return df
+
+
+def prepare_model_frames(
+    raw_df: pd.DataFrame,
+    coords: pd.DataFrame,
+    config: PipelineConfig,
+    distances: Optional[pd.DataFrame] = None,
+) -> Dict[str, pd.DataFrame]:
+    target_wells = get_target_wells(raw_df, config)
+    if not target_wells:
+        raise ValueError("No producer wells satisfy the selection criteria.")
+    prod_df = raw_df[raw_df["well"].isin(target_wells)].copy()
+    prod_df = reindex_series(prod_df, target_wells, config.freq)
+    if prod_df.empty:
+        raise ValueError("Reindexed producer dataframe is empty.")
+    prod_df["type"] = prod_df.groupby("well")["type"].transform(lambda s: s.ffill().bfill())
+    numeric_cols = [col for col in prod_df.columns if col not in {"ds", "well", "type"}]
+    prod_df = impute_numeric(prod_df, "well", numeric_cols)
+    prod_df["wlpr"] = prod_df["wlpr"].fillna(0.0)
+    date_index = pd.date_range(prod_df["ds"].min(), prod_df["ds"].max(), freq=config.freq)
+    inj_features = build_injection_features(
+        raw_df,
+        coords,
+        target_wells,
+        date_index,
+        distances=distances,
+    )
+    prod_df = prod_df.merge(inj_features, on=["ds", "well"], how="left")
+    prod_df[["inj_wwir_weighted", "inj_wwit_diff_weighted"]] = prod_df[[
+        "inj_wwir_weighted",
+        "inj_wwit_diff_weighted",
+    ]].fillna(0.0)
+    lag_spec = {
+        "inj_wwir_weighted": [1, 3, 6],
+        "inj_wwit_diff_weighted": [1],
+        "wwir": [1, 3, 6],
+        "wwit_diff": [1],
+    }
+    lagged_cols: List[str] = []
+    for col, lags in lag_spec.items():
+        lagged_cols.extend(add_lag_features(prod_df, "well", [col], lags))
+    if lagged_cols:
+        prod_df[lagged_cols] = prod_df[lagged_cols].fillna(0.0)
+    rolling_spec = {
+        "inj_wwir_weighted": [3, 6],
+        "wwir": [3, 6],
+    }
+    rolling_cols: List[str] = []
+    for col, windows in rolling_spec.items():
+        rolling_cols.extend(add_rolling_features(prod_df, "well", [col], windows))
+    if rolling_cols:
+        prod_df[rolling_cols] = prod_df[rolling_cols].fillna(0.0)
+    prod_df["type_prod"] = (prod_df["type"] == "PROD").astype(int)
+    prod_df["type_inj"] = (prod_df["type"] == "INJ").astype(int)
+    prod_df["month"] = prod_df["ds"].dt.month
+    prod_df["month_sin"] = np.sin(2 * np.pi * prod_df["month"] / 12.0)
+    prod_df["month_cos"] = np.cos(2 * np.pi * prod_df["month"] / 12.0)
+    prod_df["time_idx"] = prod_df.sort_values("ds").groupby("well").cumcount()
+    prod_df["unique_id"] = prod_df["well"]
+    prod_df["y"] = prod_df["wlpr"].astype(float)
+    prod_df = prod_df.drop(columns=["type"], errors="ignore")
+    feature_cols = set(config.hist_exog + config.futr_exog)
+    missing_features = [col for col in feature_cols if col not in prod_df.columns]
+    if missing_features:
+        raise ValueError(f"Missing required features: {missing_features}")
+    max_dates = prod_df.groupby("unique_id")["ds"].max()
+    target_end = max_dates.min()
+    test_start = target_end - pd.DateOffset(months=config.horizon - 1)
+    train_df = prod_df[prod_df["ds"] < test_start].copy()
+    test_df = prod_df[prod_df["ds"] >= test_start].copy()
+    if train_df.empty or test_df.empty:
+        raise ValueError("Train or test dataframe is empty after splitting.")
+    train_df = train_df.sort_values(["unique_id", "ds"])  # ensure order
+    test_df = test_df.sort_values(["unique_id", "ds"])
+    futr_df = test_df[["unique_id", "ds"] + config.futr_exog].copy()
+    static_df = coords[coords["well"].isin(target_wells)].copy()
+    static_df = static_df.rename(columns={"well": "unique_id"})
+    static_df = static_df.drop_duplicates(subset=["unique_id"])[["unique_id", "x", "y", "z"]].reset_index(drop=True)
+    logger.info(
+        "Prepared frames: train=%d rows, test=%d rows, future=%d rows",
+        len(train_df),
+        len(test_df),
+        len(futr_df),
+    )
+    return {
+        "train_df": train_df,
+        "test_df": test_df,
+        "futr_df": futr_df,
+        "static_df": static_df,
+        "target_wells": target_wells,
+        "test_start": test_start,
+    }
+
+
+def _create_model(config: PipelineConfig, n_series: int) -> TSMixerx:
+    loss_cls = LOSS_REGISTRY.get(config.loss.lower())
+    if loss_cls is None:
+        raise ValueError(f"Неизвестная функция потерь: {config.loss}")
+    valid_loss_cls: Optional[Any] = None
+    if config.valid_loss:
+        valid_loss_cls = LOSS_REGISTRY.get(config.valid_loss.lower())
+        if valid_loss_cls is None:
+            raise ValueError(f"Неизвестная валидационная функция потерь: {config.valid_loss}")
+    optimizer_key = config.optimizer_name.lower().strip() if config.optimizer_name else None
+    optimizer_cls: Optional[Type[Optimizer]] = None
+    if optimizer_key:
+        optimizer_cls = OPTIMIZER_REGISTRY.get(optimizer_key)
+        if optimizer_cls is None:
+            raise ValueError(f"Неизвестный оптимизатор: {config.optimizer_name}")
+    scheduler_cls: Optional[Type[LRScheduler]] = None
+    scheduler_kwargs = dict(config.lr_scheduler_kwargs) if config.lr_scheduler_kwargs else {}
+    if config.lr_scheduler_name:
+        scheduler_key = config.lr_scheduler_name.lower().strip()
+        scheduler_cls = SCHEDULER_REGISTRY.get(scheduler_key)
+        if scheduler_cls is None:
+            raise ValueError(f"Неизвестный планировщик скорости обучения: {config.lr_scheduler_name}")
+        if scheduler_cls is OneCycleLR:
+            scheduler_kwargs.setdefault("max_lr", config.learning_rate * 10.0)
+            scheduler_kwargs.setdefault("total_steps", config.max_steps)
+            scheduler_kwargs.setdefault("pct_start", 0.3)
+            scheduler_kwargs.setdefault("anneal_strategy", "cos")
+        elif scheduler_cls is StepLR:
+            scheduler_kwargs.setdefault("step_size", max(config.max_steps // max(config.num_lr_decays, 1), 1))
+            scheduler_kwargs.setdefault("gamma", 0.5)
+        elif scheduler_cls is CosineAnnealingLR:
+            scheduler_kwargs.setdefault("T_max", config.max_steps)
+        elif scheduler_cls is ReduceLROnPlateau:
+            scheduler_kwargs.setdefault("mode", "min")
+            scheduler_kwargs.setdefault("factor", 0.5)
+            scheduler_kwargs.setdefault("patience", max(config.early_stop_patience_steps // 2, 1))
+    base_kwargs: Dict[str, Any] = {
+        "h": config.horizon,
+        "input_size": config.input_size,
+        "n_series": n_series,
+        "futr_exog_list": config.futr_exog,
+        "hist_exog_list": config.hist_exog,
+        "stat_exog_list": config.static_exog,
+        "n_block": config.n_block,
+        "ff_dim": config.ff_dim,
+        "dropout": config.dropout,
+        "learning_rate": config.learning_rate,
+        "max_steps": config.max_steps,
+        "early_stop_patience_steps": config.early_stop_patience_steps,
+        "val_check_steps": config.val_check_steps,
+        "batch_size": config.batch_size,
+        "windows_batch_size": config.windows_batch_size,
+        "num_lr_decays": config.num_lr_decays,
+        "scaler_type": config.scaler_type,
+        "random_seed": config.random_seed,
+        "alias": "tsmixerx_wlpr",
+        "loss": loss_cls(),
+        "valid_loss": valid_loss_cls() if valid_loss_cls else None,
+        "exclude_insample_y": config.exclude_insample_y,
+        "revin": config.revin,
+        "valid_batch_size": config.valid_batch_size,
+        "inference_windows_batch_size": config.inference_windows_batch_size,
+        "start_padding_enabled": config.start_padding_enabled,
+        "training_data_availability_threshold": config.training_data_availability_threshold,
+        "step_size": config.step_size,
+        "drop_last_loader": config.drop_last_loader,
+        "optimizer": optimizer_cls,
+        "lr_scheduler": scheduler_cls,
+        "lr_scheduler_kwargs": scheduler_kwargs or None,
+        "dataloader_kwargs": config.dataloader_kwargs or None,
+    }
+    optimizer_kwargs = dict(config.optimizer_kwargs) if config.optimizer_kwargs else {}
+    if config.weight_decay and config.weight_decay > 0.0:
+        optimizer_kwargs.setdefault("weight_decay", config.weight_decay)
+    if not optimizer_cls:
+        optimizer_kwargs = {}
+    if optimizer_kwargs:
+        base_kwargs["optimizer_kwargs"] = optimizer_kwargs
+    trainer_kwargs = dict(config.trainer_kwargs) if config.trainer_kwargs else {}
+    conflicts = set(base_kwargs).intersection(trainer_kwargs)
+    if conflicts:
+        raise ValueError(
+            "Конфликт ключей между trainer_kwargs и параметрами модели: "
+            + ", ".join(sorted(conflicts))
+        )
+    filtered_kwargs = {key: value for key, value in base_kwargs.items() if value is not None}
+    return TSMixerx(**filtered_kwargs, **trainer_kwargs)
+
+
+def train_and_forecast(frames: Dict[str, pd.DataFrame], config: PipelineConfig) -> pd.DataFrame:
+    model = _create_model(config, len(frames["target_wells"]))
+    nf = NeuralForecast(models=[model], freq=config.freq)
+    nf.fit(
+        df=frames["train_df"],
+        static_df=frames["static_df"],
+        val_size=config.val_horizon,
+    )
+    preds = nf.predict(
+        futr_df=frames["futr_df"],
+        static_df=frames["static_df"],
+    )
+    preds = preds.rename(columns={"tsmixerx_wlpr": "y_hat"})
+    logger.info("Generated %d forecast rows", len(preds))
+    return preds
+
+
+def _error_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    insample: Optional[np.ndarray] = None,
+    seasonal_period: int = 1,
+) -> Dict[str, float]:
+    errors = y_true - y_pred
+    mae = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+    abs_true = np.abs(y_true)
+    wmape = float(np.sum(np.abs(errors)) / (np.sum(abs_true) + EPSILON) * 100.0)
+    denom = np.where(abs_true > EPSILON, abs_true, np.nan)
+    mape = float(np.nanmean(np.abs(errors) / denom) * 100.0)
+    smape = float(
+        np.mean(2.0 * np.abs(errors) / (abs_true + np.abs(y_pred) + EPSILON)) * 100.0
+    )
+    mase: Optional[float] = None
+    if insample is not None:
+        insample = np.asarray(insample, dtype=float)
+        if len(insample) > seasonal_period:
+            diffs = np.abs(insample[seasonal_period:] - insample[:-seasonal_period])
+            scale = float(np.mean(diffs))
+            if np.isfinite(scale) and scale > EPSILON:
+                mase = mae / scale
+    metrics = {
+        "mae": mae,
+        "rmse": rmse,
+        "mape": mape,
+        "smape": smape,
+        "wmape": wmape,
+        "mase": mase,
+    }
+    formatted: Dict[str, Optional[float]] = {}
+    for key, value in metrics.items():
+        if value is None:
+            formatted[key] = None
+        elif isinstance(value, (int, float, np.floating)) and np.isfinite(value):
+            formatted[key] = float(value)
+        else:
+            formatted[key] = None
+    return formatted
+
+
+def _format_metrics_text(metrics: Dict[str, Dict[str, Dict[str, float]]], unique_id: str) -> str:
+    per_well = metrics.get("by_well", {}).get(str(unique_id))
+    if per_well is None:
+        return "MAE: n/a\nWMAPE: n/a\nMASE: n/a\nRMSE: n/a"
+
+    def _fmt(value: Optional[float], percent: bool = False) -> str:
+        if value is None or not np.isfinite(value):
+            return "n/a"
+        return f"{value:.2f}{'%' if percent else ''}"
+
+    return "\n".join(
+        [
+            f"MAE: {_fmt(per_well.get('mae'))}",
+            f"WMAPE: {_fmt(per_well.get('wmape'), percent=True)}",
+            f"MASE: {_fmt(per_well.get('mase'))}",
+            f"RMSE: {_fmt(per_well.get('rmse'))}",
+        ]
+    )
+
+def merge_forecast_frame(pred_df: pd.DataFrame, test_df: pd.DataFrame) -> pd.DataFrame:
+    merged = test_df[["unique_id", "ds", "y"]].merge(
+        pred_df[["unique_id", "ds", "y_hat"]], on=["unique_id", "ds"], how="inner"
+    )
+    if merged.empty:
+        raise ValueError("No overlapping rows between predictions and test data.")
+    return merged.sort_values(["unique_id", "ds"]).reset_index(drop=True)
+
+
+def evaluate_predictions(
+    pred_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    train_df: pd.DataFrame,
+    seasonal_period: int = 1,
+) -> Tuple[Dict[str, Dict[str, float]], pd.DataFrame]:
+    merged = merge_forecast_frame(pred_df, test_df)
+    overall = _error_metrics(
+        merged["y"].to_numpy(),
+        merged["y_hat"].to_numpy(),
+        insample=train_df["y"].to_numpy(),
+        seasonal_period=seasonal_period,
+    )
+    per_well: Dict[str, Dict[str, float]] = {}
+    for unique_id, group in merged.groupby("unique_id"):
+        insample = train_df[train_df["unique_id"] == unique_id]["y"].to_numpy()
+        per_well[str(unique_id)] = _error_metrics(
+            group["y"].to_numpy(),
+            group["y_hat"].to_numpy(),
+            insample=insample,
+            seasonal_period=seasonal_period,
+        )
+    metrics = {"overall": overall, "by_well": per_well, "observations": int(len(merged))}
+    return metrics, merged
+
+
+def generate_forecast_pdf(
+    merged: pd.DataFrame, metrics: Dict[str, Dict[str, float]], output_dir: Path
+) -> Path:
+    """Create a multi-page PDF with actual vs forecast WLPR per well."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    pdf_path = output_dir / "wlpr_forecasts.pdf"
+    with PdfPages(pdf_path) as pdf:
+        for unique_id, group in merged.groupby("unique_id"):
+            group = group.sort_values("ds")
+            fig, ax = plt.subplots(figsize=(8.5, 5.0))
+            ax.plot(
+                group["ds"],
+                group["y"],
+                label="Actual (Test)",
+                marker="o",
+                linewidth=1.5,
+            )
+            ax.plot(
+                group["ds"],
+                group["y_hat"],
+                label="Forecast",
+                marker="x",
+                linewidth=1.5,
+            )
+            ax.set_title(f"Well {unique_id} WLPR Forecast vs Actual")
+            ax.set_ylabel("WLPR (m3/day)")
+            ax.set_xlabel("Date")
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            metrics_text = _format_metrics_text(metrics, str(unique_id))
+            ax.text(
+                0.02,
+                0.98,
+                metrics_text,
+                transform=ax.transAxes,
+                fontsize=9,
+                verticalalignment="top",
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.75},
+            )
+            fig.autofmt_xdate()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+    return pdf_path
+
+def generate_full_history_pdf(
+    frames: Dict[str, pd.DataFrame],
+    merged: pd.DataFrame,
+    metrics: Dict[str, Dict[str, float]],
+    config: PipelineConfig,
+    output_dir: Path,
+) -> Path:
+    """Create a PDF with the full WLPR history highlighting train/val/test."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    train_df = frames["train_df"][["unique_id", "ds", "y"]].copy()
+    test_df = frames["test_df"][["unique_id", "ds", "y"]].copy()
+    full_df = (
+        pd.concat([train_df, test_df], ignore_index=True)
+        .sort_values(["unique_id", "ds"])
+        .reset_index(drop=True)
+    )
+    test_start = pd.Timestamp(frames["test_start"])
+    val_offset = pd.DateOffset(months=config.val_horizon)
+    pdf_path = output_dir / "wlpr_full_history.pdf"
+    with PdfPages(pdf_path) as pdf:
+        for unique_id in frames["target_wells"]:
+            series = full_df[full_df["unique_id"] == unique_id]
+            if series.empty:
+                continue
+            fig, ax = plt.subplots(figsize=(8.5, 5.0))
+            ax.plot(
+                series["ds"],
+                series["y"],
+                label="Actual WLPR",
+                color="black",
+                linewidth=1.4,
+            )
+            forecast = merged[merged["unique_id"] == unique_id]
+            if not forecast.empty:
+                ax.plot(
+                    forecast["ds"],
+                    forecast["y_hat"],
+                    label="Forecast (Test)",
+                    marker="x",
+                    linewidth=1.5,
+                    color="tab:orange",
+                )
+            train_start = series["ds"].min()
+            test_end = series["ds"].max()
+            val_start = max(train_start, test_start - val_offset)
+            if val_start > test_start:
+                val_start = test_start
+            if train_start < val_start:
+                ax.axvspan(train_start, val_start, alpha=0.08, color="tab:blue", label="Train")
+            if val_start < test_start:
+                ax.axvspan(val_start, test_start, alpha=0.08, color="tab:green", label="Validation")
+            if test_start < test_end:
+                ax.axvspan(test_start, test_end, alpha=0.08, color="tab:red", label="Test")
+            ax.set_title(f"Well {unique_id} WLPR History (Train/Val/Test)")
+            ax.set_ylabel("WLPR (m3/day)")
+            ax.set_xlabel("Date")
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            metrics_text = _format_metrics_text(metrics, str(unique_id))
+            ax.text(
+                0.02,
+                0.98,
+                metrics_text,
+                transform=ax.transAxes,
+                fontsize=9,
+                verticalalignment="top",
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.75},
+            )
+            fig.autofmt_xdate()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+    return pdf_path
+
+
+def generate_residuals_pdf(
+    merged: pd.DataFrame, metrics: Dict[str, Dict[str, float]], output_dir: Path
+) -> Path:
+    """Create a PDF with residual plots (actual - forecast) for each well."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    residuals = merged.copy()
+    residuals["residual"] = residuals["y"] - residuals["y_hat"]
+    pdf_path = output_dir / "wlpr_residuals.pdf"
+    with PdfPages(pdf_path) as pdf:
+        for unique_id, group in residuals.groupby("unique_id"):
+            group = group.sort_values("ds")
+            fig, ax = plt.subplots(figsize=(8.5, 5.0))
+            ax.axhline(0.0, color="black", linewidth=1.0, linestyle="--", alpha=0.6)
+            ax.plot(
+                group["ds"],
+                group["residual"],
+                label="Residual (Actual - Forecast)",
+                marker="o",
+                linewidth=1.5,
+                color="tab:purple",
+            )
+            ax.fill_between(
+                group["ds"],
+                0.0,
+                group["residual"],
+                color="tab:purple",
+                alpha=0.25,
+            )
+            ax.set_title(f"Well {unique_id} WLPR Residuals (Test)")
+            ax.set_ylabel("Residual (m3/day)")
+            ax.set_xlabel("Date")
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            metrics_text = _format_metrics_text(metrics, str(unique_id))
+            ax.text(
+                0.02,
+                0.98,
+                metrics_text,
+                transform=ax.transAxes,
+                fontsize=9,
+                verticalalignment="top",
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.75},
+            )
+            fig.autofmt_xdate()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+    return pdf_path
+
+def save_artifacts(
+    pred_df: pd.DataFrame,
+    metrics: Dict[str, Dict[str, float]],
+    frames: Dict[str, pd.DataFrame],
+    config: PipelineConfig,
+    output_dir: Path,
+    pdf_paths: Optional[Dict[str, str]] = None,
+    cv_results: Optional[Dict[str, object]] = None,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    preds_path = output_dir / "wlpr_predictions.csv"
+    pred_df.to_csv(preds_path, index=False)
+    metrics_path = output_dir / "metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, indent=2)
+    metadata = {
+        "config": asdict(config),
+        "target_wells": frames["target_wells"],
+        "test_start": frames["test_start"].strftime("%Y-%m-%d"),
+        "train_rows": int(len(frames["train_df"])),
+        "test_rows": int(len(frames["test_df"])),
+    }
+    if pdf_paths:
+        metadata["pdf_reports"] = {key: str(value) for key, value in pdf_paths.items()}
+    if cv_results:
+        cv_path = output_dir / "cv_metrics.json"
+        with open(cv_path, "w", encoding="utf-8") as handle:
+            json.dump(cv_results, handle, indent=2)
+        metadata["walk_forward_cv"] = {
+            "folds": len(cv_results.get("folds", [])),
+            "aggregate": cv_results.get("aggregate"),
+            "details_path": str(cv_path),
+        }
+    metadata_path = output_dir / "metadata.json"
+    with open(metadata_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+    logger.info("Artifacts saved to %s", output_dir)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="WLPR forecasting pipeline using TSMixerx")
+    parser.add_argument(
+        "--data-path",
+        type=Path,
+        default=Path("MODEL_22.09.25.csv"),
+        help="Path to the monthly well dataset",
+    )
+    parser.add_argument(
+        "--coords-path",
+        type=Path,
+        default=Path("coords.txt"),
+        help="Path to the well coordinates file",
+    )
+    parser.add_argument(
+        "--distances-path",
+        type=Path,
+        default=Path("well_distances.xlsx"),
+        help="Path to the well-to-well distance matrix (.xlsx)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("artifacts"),
+        help="Directory to store predictions and metrics",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    torch.set_float32_matmul_precision("high")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    args = parse_args()
+    if not args.data_path.exists():
+        raise FileNotFoundError(f"Dataset not found at {args.data_path}")
+    if not args.coords_path.exists():
+        raise FileNotFoundError(f"Coordinate file not found at {args.coords_path}")
+    config = PipelineConfig()
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    raw_df = load_raw_data(args.data_path)
+    coords = load_coordinates(args.coords_path)
+    distances = None
+    if args.distances_path and args.distances_path.exists():
+        distances = load_distance_matrix(args.distances_path)
+    elif args.distances_path:
+        logger.warning(
+            "Distance file not found at %s. Falling back to coordinate-based distances.",
+            args.distances_path,
+        )
+    frames = prepare_model_frames(raw_df, coords, config, distances=distances)
+    cv_results = run_walk_forward_validation(
+        frames["train_df"],
+        frames["static_df"],
+        config,
+    )
+    preds = train_and_forecast(frames, config)
+    metrics, merged = evaluate_predictions(
+        preds,
+        frames["test_df"],
+        frames["train_df"],
+    )
+    forecast_pdf = generate_forecast_pdf(merged, metrics, output_dir)
+    full_history_pdf = generate_full_history_pdf(frames, merged, metrics, config, output_dir)
+    residuals_pdf = generate_residuals_pdf(merged, metrics, output_dir)
+    pdf_paths = {
+        "test_forecast": str(forecast_pdf),
+        "full_history": str(full_history_pdf),
+        "residuals": str(residuals_pdf),
+    }
+    save_artifacts(
+        preds,
+        metrics,
+        frames,
+        config,
+        output_dir,
+        pdf_paths=pdf_paths,
+        cv_results=cv_results,
+    )
+    logger.info("Pipeline complete. Overall metrics: %s", metrics["overall"])
+    if cv_results and cv_results.get("aggregate"):
+        logger.info("Walk-forward CV aggregate metrics: %s", cv_results["aggregate"])
+    logger.info("Forecast reports saved: %s", pdf_paths)
+
+
+if __name__ == "__main__":
+    main()
