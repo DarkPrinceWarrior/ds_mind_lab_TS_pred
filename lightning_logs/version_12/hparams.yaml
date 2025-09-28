@@ -6,10 +6,11 @@ dataloader_kwargs:
   pin_memory: false
 devices: 1
 drop_last_loader: false
-dropout: 0.2
+dropout: 0.1
 early_stop_patience_steps: 50
+enable_model_summary: false
 exclude_insample_y: false
-ff_dim: 256
+ff_dim: 64
 futr_exog_list:
 - month_sin
 - month_cos
@@ -63,13 +64,14 @@ inference_windows_batch_size: 64
 input_size: 48
 learning_rate: 0.0005
 log_every_n_steps: 10
-loss: !!python/object:neuralforecast.losses.pytorch.HuberLoss
+loss: !!python/object:__main__.PhysicsInformedLoss
   _backward_hooks: !!python/object/apply:collections.OrderedDict
   - []
   _backward_pre_hooks: !!python/object/apply:collections.OrderedDict
   - []
   _buffers: !!python/object/apply:collections.OrderedDict
   - []
+  _context: null
   _forward_hooks: !!python/object/apply:collections.OrderedDict
   - []
   _forward_hooks_always_called: !!python/object/apply:collections.OrderedDict
@@ -86,7 +88,45 @@ loss: !!python/object:neuralforecast.losses.pytorch.HuberLoss
   _load_state_dict_pre_hooks: !!python/object/apply:collections.OrderedDict
   - []
   _modules: !!python/object/apply:collections.OrderedDict
-  - []
+  - - - base_loss
+      - !!python/object:neuralforecast.losses.pytorch.HuberLoss
+        _backward_hooks: !!python/object/apply:collections.OrderedDict
+        - []
+        _backward_pre_hooks: !!python/object/apply:collections.OrderedDict
+        - []
+        _buffers: !!python/object/apply:collections.OrderedDict
+        - []
+        _forward_hooks: !!python/object/apply:collections.OrderedDict
+        - []
+        _forward_hooks_always_called: !!python/object/apply:collections.OrderedDict
+        - []
+        _forward_hooks_with_kwargs: !!python/object/apply:collections.OrderedDict
+        - []
+        _forward_pre_hooks: !!python/object/apply:collections.OrderedDict
+        - []
+        _forward_pre_hooks_with_kwargs: !!python/object/apply:collections.OrderedDict
+        - []
+        _is_full_backward_hook: null
+        _load_state_dict_post_hooks: !!python/object/apply:collections.OrderedDict
+        - []
+        _load_state_dict_pre_hooks: !!python/object/apply:collections.OrderedDict
+        - []
+        _modules: !!python/object/apply:collections.OrderedDict
+        - []
+        _non_persistent_buffers_set: !!set {}
+        _parameters: !!python/object/apply:collections.OrderedDict
+        - []
+        _state_dict_hooks: !!python/object/apply:collections.OrderedDict
+        - []
+        _state_dict_pre_hooks: !!python/object/apply:collections.OrderedDict
+        - []
+        delta: 1.0
+        horizon_weight: null
+        is_distribution_output: false
+        output_names: &id001
+        - ''
+        outputsize_multiplier: 1
+        training: true
   _non_persistent_buffers_set: !!set {}
   _parameters: !!python/object/apply:collections.OrderedDict
   - []
@@ -94,12 +134,17 @@ loss: !!python/object:neuralforecast.losses.pytorch.HuberLoss
   - []
   _state_dict_pre_hooks: !!python/object/apply:collections.OrderedDict
   - []
-  delta: 1.0
+  damping: 0.01
+  feature_names:
+  - inj_wwir_weighted
   horizon_weight: null
+  injection_coefficient: 0.08
   is_distribution_output: false
-  output_names:
-  - ''
+  latest_terms: {}
+  output_names: *id001
   outputsize_multiplier: 1
+  physics_weight: 0.2
+  smoothing_weight: 0.0
   training: true
 lr_scheduler: !!python/name:torch.optim.lr_scheduler.OneCycleLR ''
 lr_scheduler_kwargs:
@@ -109,7 +154,7 @@ lr_scheduler_kwargs:
   pct_start: 0.3
   total_steps: 250
 max_steps: 250
-n_block: 6
+n_block: 2
 n_samples: 100
 n_series: 13
 num_lr_decays: 2
@@ -118,7 +163,6 @@ optimizer_kwargs:
   betas: !!python/tuple
   - 0.9
   - 0.99
-  lr: 0.0005
   weight_decay: 0.0001
 precision: 16-mixed
 random_seed: 42

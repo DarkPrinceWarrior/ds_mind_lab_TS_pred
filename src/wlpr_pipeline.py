@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from neuralforecast import NeuralForecast
 from neuralforecast.models.tsmixerx import TSMixerx
-from neuralforecast.losses.pytorch import HuberLoss, MAE, MAPE, MSE, SMAPE
+from neuralforecast.losses.pytorch import BasePointLoss, HuberLoss, MAE, MAPE, MSE, SMAPE
 import torch
 from torch.optim import Adam, AdamW, Optimizer, SGD
 from torch.optim.lr_scheduler import (
@@ -45,6 +45,280 @@ SCHEDULER_REGISTRY: Dict[str, Type[LRScheduler]] = {
     "cosine": CosineAnnealingLR,
     "reducelronplateau": ReduceLROnPlateau,
 }
+
+
+
+class PhysicsInformedLoss(BasePointLoss):
+    """Blend data loss with a reservoir-inspired penalty on forecast dynamics."""
+
+    def __init__(
+        self,
+        base_loss: Optional[BasePointLoss] = None,
+        physics_weight: float = 0.1,
+        injection_coefficient: float = 0.05,
+        damping: float = 0.01,
+        smoothing_weight: float = 0.0,
+        feature_names: Optional[List[str]] = None,
+    ) -> None:
+        if base_loss is None:
+            base_loss = HuberLoss()
+        super().__init__(
+            horizon_weight=base_loss.horizon_weight,
+            outputsize_multiplier=base_loss.outputsize_multiplier,
+            output_names=base_loss.output_names,
+        )
+        self.base_loss = base_loss
+        self.is_distribution_output = getattr(base_loss, "is_distribution_output", False)
+        self.physics_weight = float(physics_weight)
+        self.injection_coefficient = float(injection_coefficient)
+        self.damping = float(damping)
+        self.smoothing_weight = float(smoothing_weight)
+        self.feature_names = list(feature_names) if feature_names else []
+        self._context: Optional[Dict[str, torch.Tensor]] = None
+        self.latest_terms: Dict[str, torch.Tensor] = {}
+
+    def domain_map(self, y_hat: torch.Tensor) -> torch.Tensor:
+        return self.base_loss.domain_map(y_hat)
+
+    def set_context(
+        self,
+        injection: torch.Tensor,
+        prev: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> None:
+        self._context = {
+            "injection": injection,
+            "prev": prev,
+            "mask": mask,
+        }
+
+    def clear_context(self) -> None:
+        self._context = None
+
+    def _physics_residual(
+        self,
+        y_hat: torch.Tensor,
+        injection: torch.Tensor,
+        prev: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        injection = injection.to(y_hat)
+        prev = prev.to(y_hat)
+        if mask is not None:
+            mask = mask.to(y_hat)
+        history = torch.cat([prev.unsqueeze(1), y_hat], dim=1)
+        prev_steps = history[:, :-1, :]
+        deltas = history[:, 1:, :] - prev_steps
+        target = self.injection_coefficient * injection - self.damping * prev_steps
+        residual = deltas - target
+        weight = torch.ones_like(residual) if mask is None else mask
+        denom = torch.clamp(weight.sum(), min=EPSILON)
+        penalty = torch.sum((residual ** 2) * weight) / denom
+        if self.smoothing_weight > 0.0:
+            smooth = residual[:, 1:, :] - residual[:, :-1, :]
+            smooth_weight = (
+                torch.ones_like(smooth)
+                if mask is None
+                else mask[:, 1:, :] * mask[:, :-1, :]
+            )
+            smooth_denom = torch.clamp(smooth_weight.sum(), min=EPSILON)
+            penalty = penalty + self.smoothing_weight * torch.sum((smooth ** 2) * smooth_weight) / smooth_denom
+        return penalty
+
+    def __call__(
+        self,
+        y: torch.Tensor,
+        y_hat: torch.Tensor,
+        y_insample: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        data_loss = self.base_loss(
+            y=y,
+            y_hat=y_hat,
+            y_insample=y_insample,
+            mask=mask,
+        )
+        physics_penalty = data_loss.new_zeros(())
+        if self.physics_weight > 0.0 and self._context is not None:
+            ctx = self._context
+            physics_penalty = self._physics_residual(
+                y_hat=y_hat,
+                injection=ctx["injection"],
+                prev=ctx["prev"],
+                mask=ctx.get("mask"),
+            )
+        total = data_loss + self.physics_weight * physics_penalty
+        self.latest_terms = {
+            "data": data_loss.detach(),
+            "physics": physics_penalty.detach(),
+        }
+        self.clear_context()
+        return total
+
+
+class PhysicsInformedTSMixerx(TSMixerx):
+    """TSMixerx variant that injects physics-aware loss context during training."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.physics_feature_indices: List[int] = []
+        self._physics_warned_missing = False
+        if isinstance(self.loss, PhysicsInformedLoss):
+            self._init_physics_feature_indices()
+
+    def _init_physics_feature_indices(self) -> None:
+        available = list(self.futr_exog_list) if self.futr_exog_list else []
+        indices: List[int] = []
+        missing: List[str] = []
+        for name in getattr(self.loss, "feature_names", []):
+            if name in available:
+                indices.append(available.index(name))
+            else:
+                missing.append(name)
+        self.physics_feature_indices = indices
+        if missing and not self._physics_warned_missing:
+            logger.warning(
+                "Physics features %s are missing from futr_exog_list and will be ignored.",
+                missing,
+            )
+            self._physics_warned_missing = True
+
+    def _prepare_physics_context(
+        self,
+        futr_exog: Optional[torch.Tensor],
+        insample_y: torch.Tensor,
+        outsample_mask: Optional[torch.Tensor],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if (
+            futr_exog is None
+            or futr_exog.ndim != 4
+            or not self.physics_feature_indices
+        ):
+            return None
+        horizon_slice = futr_exog[:, :, self.input_size :, :]
+        if horizon_slice.shape[2] < self.h:
+            return None
+        selected: List[torch.Tensor] = []
+        for idx in self.physics_feature_indices:
+            if idx < horizon_slice.shape[1]:
+                selected.append(horizon_slice[:, idx, : self.h, :])
+        if not selected:
+            return None
+        injection = torch.stack(selected, dim=0).mean(dim=0)
+        prev = insample_y[:, -1, :]
+        mask = None if outsample_mask is None else outsample_mask[:, : self.h, :]
+        return {
+            "injection": injection,
+            "prev": prev,
+            "mask": mask,
+        }
+
+    def training_step(self, batch, batch_idx):
+        if self.RECURRENT:
+            self.h = self.h_train
+
+        y_idx = batch["y_idx"]
+        temporal_cols = batch["temporal_cols"]
+        windows_temporal, static, static_cols = self._create_windows(batch, step="train")
+        windows = self._sample_windows(
+            windows_temporal, static, static_cols, temporal_cols, step="train"
+        )
+        original_outsample_y = torch.clone(
+            windows["temporal"][:, self.input_size :, y_idx]
+        )
+        windows = self._normalization(windows=windows, y_idx=y_idx)
+
+        (
+            insample_y,
+            insample_mask,
+            outsample_y,
+            outsample_mask,
+            hist_exog,
+            futr_exog,
+            stat_exog,
+        ) = self._parse_windows(batch, windows)
+
+        windows_batch = dict(
+            insample_y=insample_y,
+            insample_mask=insample_mask,
+            futr_exog=futr_exog,
+            hist_exog=hist_exog,
+            stat_exog=stat_exog,
+        )
+
+        if isinstance(self.loss, PhysicsInformedLoss):
+            context = self._prepare_physics_context(
+                futr_exog=futr_exog,
+                insample_y=insample_y,
+                outsample_mask=outsample_mask,
+            )
+            if context is not None:
+                self.loss.set_context(**context)
+            else:
+                self.loss.clear_context()
+
+        output = self(windows_batch)
+        output = self.loss.domain_map(output)
+
+        if self.loss.is_distribution_output:
+            y_loc, y_scale = self._get_loc_scale(y_idx)
+            outsample_y = original_outsample_y
+            distr_args = self.loss.scale_decouple(
+                output=output, loc=y_loc, scale=y_scale
+            )
+            loss = self.loss(
+                y=outsample_y,
+                distr_args=distr_args,
+                mask=outsample_mask,
+            )
+        else:
+            loss = self.loss(
+                y=outsample_y,
+                y_hat=output,
+                y_insample=insample_y,
+                mask=outsample_mask,
+            )
+
+        if torch.isnan(loss):
+            print("Model Parameters", self.hparams)
+            print("insample_y", torch.isnan(insample_y).sum())
+            print("outsample_y", torch.isnan(outsample_y).sum())
+            raise Exception("Loss is NaN, training stopped.")
+
+        train_loss_log = loss.detach().item()
+        self.log(
+            "train_loss",
+            train_loss_log,
+            batch_size=outsample_y.size(0),
+            prog_bar=True,
+            on_epoch=True,
+        )
+
+        if isinstance(self.loss, PhysicsInformedLoss) and self.loss.latest_terms:
+            data_term = self.loss.latest_terms.get("data")
+            physics_term = self.loss.latest_terms.get("physics")
+            if data_term is not None:
+                self.log(
+                    "train_data_loss",
+                    float(data_term.item()),
+                    batch_size=outsample_y.size(0),
+                    on_epoch=True,
+                )
+            if physics_term is not None:
+                self.log(
+                    "train_physics_penalty",
+                    float(physics_term.item()),
+                    batch_size=outsample_y.size(0),
+                    on_epoch=True,
+                )
+
+        self.train_trajectories.append((self.global_step, train_loss_log))
+        self.h = self.horizon_backup
+
+        return loss
+
+
+LOSS_REGISTRY["physics"] = PhysicsInformedLoss
 
 
 @dataclass
@@ -82,6 +356,12 @@ class PipelineConfig:
     training_data_availability_threshold: float | List[float] = 0.1
     step_size: int = 1
     drop_last_loader: bool = False
+    physics_weight: float = 0.1
+    physics_injection_coeff: float = 0.05
+    physics_damping: float = 0.01
+    physics_smoothing_weight: float = 0.0
+    physics_features: List[str] = field(default_factory=lambda: ['inj_wwir_weighted'])
+    physics_base_loss: str = "huber"
     optimizer_name: Optional[str] = "adamw"
     optimizer_kwargs: Dict[str, Any] = field(default_factory=lambda: {"betas": (0.9, 0.99)})
     lr_scheduler_name: Optional[str] = "onecycle"
@@ -662,28 +942,29 @@ def prepare_model_frames(
     }
 
 
+
 def _create_model(config: PipelineConfig, n_series: int) -> TSMixerx:
-    loss_cls = LOSS_REGISTRY.get(config.loss.lower())
-    if loss_cls is None:
-        raise ValueError(f"Неизвестная функция потерь: {config.loss}")
+    loss_key = config.loss.lower()
     valid_loss_cls: Optional[Any] = None
     if config.valid_loss:
         valid_loss_cls = LOSS_REGISTRY.get(config.valid_loss.lower())
         if valid_loss_cls is None:
-            raise ValueError(f"Неизвестная валидационная функция потерь: {config.valid_loss}")
+            raise ValueError(f"Unknown loss function: {config.valid_loss}")
+
     optimizer_key = config.optimizer_name.lower().strip() if config.optimizer_name else None
     optimizer_cls: Optional[Type[Optimizer]] = None
     if optimizer_key:
         optimizer_cls = OPTIMIZER_REGISTRY.get(optimizer_key)
         if optimizer_cls is None:
-            raise ValueError(f"Неизвестный оптимизатор: {config.optimizer_name}")
+            raise ValueError(f"Unknown optimizer: {config.optimizer_name}")
+
     scheduler_cls: Optional[Type[LRScheduler]] = None
     scheduler_kwargs = dict(config.lr_scheduler_kwargs) if config.lr_scheduler_kwargs else {}
     if config.lr_scheduler_name:
         scheduler_key = config.lr_scheduler_name.lower().strip()
         scheduler_cls = SCHEDULER_REGISTRY.get(scheduler_key)
         if scheduler_cls is None:
-            raise ValueError(f"Неизвестный планировщик скорости обучения: {config.lr_scheduler_name}")
+            raise ValueError(f"Unknown scheduler: {config.lr_scheduler_name}")
         if scheduler_cls is OneCycleLR:
             scheduler_kwargs.setdefault("max_lr", config.learning_rate * 10.0)
             scheduler_kwargs.setdefault("total_steps", config.max_steps)
@@ -698,6 +979,34 @@ def _create_model(config: PipelineConfig, n_series: int) -> TSMixerx:
             scheduler_kwargs.setdefault("mode", "min")
             scheduler_kwargs.setdefault("factor", 0.5)
             scheduler_kwargs.setdefault("patience", max(config.early_stop_patience_steps // 2, 1))
+
+    if loss_key == "physics":
+        base_loss_key = (config.physics_base_loss or "huber").lower()
+        if base_loss_key == "physics":
+            raise ValueError("physics_base_loss cannot be 'physics'.")
+        base_loss_cls = LOSS_REGISTRY.get(base_loss_key)
+        if base_loss_cls is None:
+            raise ValueError(
+                f"Unknown base loss for physics-informed setup: {config.physics_base_loss}"
+            )
+        model_loss = PhysicsInformedLoss(
+            base_loss=base_loss_cls(),
+            physics_weight=config.physics_weight,
+            injection_coefficient=config.physics_injection_coeff,
+            damping=config.physics_damping,
+            smoothing_weight=config.physics_smoothing_weight,
+            feature_names=config.physics_features,
+        )
+        model_cls: Type[TSMixerx] = PhysicsInformedTSMixerx
+    else:
+        loss_cls = LOSS_REGISTRY.get(loss_key)
+        if loss_cls is None:
+            raise ValueError(f"Unknown loss function: {config.loss}")
+        model_loss = loss_cls()
+        model_cls = TSMixerx
+
+    valid_loss_instance = valid_loss_cls() if valid_loss_cls else None
+
     base_kwargs: Dict[str, Any] = {
         "h": config.horizon,
         "input_size": config.input_size,
@@ -718,8 +1027,8 @@ def _create_model(config: PipelineConfig, n_series: int) -> TSMixerx:
         "scaler_type": config.scaler_type,
         "random_seed": config.random_seed,
         "alias": "tsmixerx_wlpr",
-        "loss": loss_cls(),
-        "valid_loss": valid_loss_cls() if valid_loss_cls else None,
+        "loss": model_loss,
+        "valid_loss": valid_loss_instance,
         "exclude_insample_y": config.exclude_insample_y,
         "revin": config.revin,
         "valid_batch_size": config.valid_batch_size,
@@ -733,6 +1042,7 @@ def _create_model(config: PipelineConfig, n_series: int) -> TSMixerx:
         "lr_scheduler_kwargs": scheduler_kwargs or None,
         "dataloader_kwargs": config.dataloader_kwargs or None,
     }
+
     optimizer_kwargs = dict(config.optimizer_kwargs) if config.optimizer_kwargs else {}
     if config.weight_decay and config.weight_decay > 0.0:
         optimizer_kwargs.setdefault("weight_decay", config.weight_decay)
@@ -740,15 +1050,16 @@ def _create_model(config: PipelineConfig, n_series: int) -> TSMixerx:
         optimizer_kwargs = {}
     if optimizer_kwargs:
         base_kwargs["optimizer_kwargs"] = optimizer_kwargs
+
     trainer_kwargs = dict(config.trainer_kwargs) if config.trainer_kwargs else {}
     conflicts = set(base_kwargs).intersection(trainer_kwargs)
     if conflicts:
         raise ValueError(
-            "Конфликт ключей между trainer_kwargs и параметрами модели: "
-            + ", ".join(sorted(conflicts))
+            "trainer_kwargs override protected arguments: " + ", ".join(sorted(conflicts))
         )
+
     filtered_kwargs = {key: value for key, value in base_kwargs.items() if value is not None}
-    return TSMixerx(**filtered_kwargs, **trainer_kwargs)
+    return model_cls(**filtered_kwargs, **trainer_kwargs)
 
 
 def train_and_forecast(frames: Dict[str, pd.DataFrame], config: PipelineConfig) -> pd.DataFrame:
@@ -1125,7 +1436,8 @@ def main() -> None:
         raise FileNotFoundError(f"Dataset not found at {args.data_path}")
     if not args.coords_path.exists():
         raise FileNotFoundError(f"Coordinate file not found at {args.coords_path}")
-    config = PipelineConfig()
+    # config = PipelineConfig()
+    config = PipelineConfig(loss="physics")
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_df = load_raw_data(args.data_path)
