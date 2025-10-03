@@ -51,6 +51,18 @@ SCHEDULER_REGISTRY: Dict[str, Type[LRScheduler]] = {
     "reducelronplateau": ReduceLROnPlateau,
 }
 
+def _default_kernel_candidates() -> List[Dict[str, Any]]:
+    return [
+        {"type": "idw", "calibrate": True, "params": {"p": 1.5}, "param_grid": {"p": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]}},
+        {"type": "exponential", "calibrate": True, "params": {"scale": 400.0}, "param_grid": {"scale": [200.0, 400.0, 600.0, 800.0, 1000.0]}},
+        {"type": "gaussian", "calibrate": True, "params": {"scale": 400.0}, "param_grid": {"scale": [200.0, 400.0, 600.0, 800.0, 1000.0]}},
+        {"type": "matern", "calibrate": True, "params": {"scale": 400.0, "nu": 1.5}, "param_grid": {"scale": [200.0, 400.0, 600.0, 800.0], "nu": [0.5, 1.5, 2.5]}},
+        {"type": "rational_quadratic", "calibrate": True, "params": {"scale": 400.0, "alpha": 1.0}, "param_grid": {"scale": [200.0, 400.0, 600.0, 800.0], "alpha": [0.5, 1.0, 2.0]}},
+    ]
+
+
+
+
 
 
 class PhysicsInformedLoss(BasePointLoss):
@@ -322,9 +334,7 @@ class PhysicsInformedTSMixerx(TSMixerx):
 
         return loss
 
-
 LOSS_REGISTRY["physics"] = PhysicsInformedLoss
-
 
 @dataclass
 class PipelineConfig:
@@ -368,7 +378,14 @@ class PipelineConfig:
     physics_features: List[str] = field(default_factory=lambda: ["inj_wwir_lag_weighted"])
     physics_base_loss: str = "huber"
     inj_top_k: int = 5
+    inj_kernel_type: str = "idw"
     inj_kernel_p: float = 2.0
+    inj_kernel_params: Dict[str, float] = field(default_factory=dict)
+    inj_kernel_calibrate: bool = True
+    inj_kernel_param_grid: Dict[str, List[float]] = field(default_factory=dict)
+    inj_kernel_candidates: List[Dict[str, Any]] = field(default_factory=_default_kernel_candidates)
+    inj_distance_anisotropy: Optional[Dict[str, Any]] = None
+    inj_directional_bias: Optional[Dict[str, Any]] = None
     use_crm_filter: bool = True
     tau_bound_multiplier: float = 2.0
     lag_min_overlap: int = 6
@@ -423,6 +440,7 @@ class PipelineConfig:
     static_exog: List[str] = field(default_factory=lambda: ["x", "y", "z"])
 
 
+
 def load_raw_data(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, sep=";")
     df = df.rename(columns={"DATA": "date", "TYPE": "type"})
@@ -441,6 +459,33 @@ def load_raw_data(path: Path) -> pd.DataFrame:
     df = df.sort_values(["well", "date"])
     df = df.drop_duplicates(["well", "date"])
     logger.info("Loaded %d rows for %d wells", len(df), df["well"].nunique())
+    return df
+
+
+
+
+def _enforce_monotonic_cumulative(df: pd.DataFrame, group_col: str, columns: List[str]) -> pd.DataFrame:
+    for col in columns:
+        if col in df.columns:
+            df[col] = df.groupby(group_col)[col].cummax()
+    return df
+
+
+def _clip_non_negative(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    for col in columns:
+        if col in df.columns:
+            df[col] = df[col].clip(lower=0.0)
+    return df
+
+
+def _compute_watercut(df: pd.DataFrame) -> pd.DataFrame:
+    required = {"wlpr", "womr"}
+    if not required.issubset(df.columns):
+        return df
+    total = df["wlpr"].abs().clip(lower=1e-6)
+    water = (df["wlpr"] - df["womr"]).clip(lower=0.0)
+    fw = (water / total).clip(0.0, 1.0).fillna(0.0)
+    df["fw"] = fw
     return df
 
 
@@ -741,11 +786,27 @@ def _apply_injection_lag_features(
         distances=distances,
         physics_estimates=config.physics_estimates,
         topK=config.inj_top_k,
+        kernel_type=config.inj_kernel_type,
         kernel_p=config.inj_kernel_p,
+        kernel_params=config.inj_kernel_params,
+        calibrate_kernel=config.inj_kernel_calibrate,
+        kernel_param_grid=config.inj_kernel_param_grid,
+        kernel_candidates=config.inj_kernel_candidates,
+        anisotropy=config.inj_distance_anisotropy,
+        directional_bias=config.inj_directional_bias,
         use_crm=config.use_crm_filter,
         tau_bound_multiplier=config.tau_bound_multiplier,
         min_overlap=config.lag_min_overlap,
     )
+    kernel_metadata = None
+    if not pair_summary.empty and {'kernel_type', 'kernel_params', 'kernel_score'} <= set(pair_summary.columns):
+        kernel_metadata = {
+            'kernel_type': pair_summary['kernel_type'].iloc[0],
+            'kernel_params': pair_summary['kernel_params'].iloc[0],
+            'kernel_score': float(pair_summary['kernel_score'].iloc[0]),
+        }
+        logger.info("Best injection kernel: %s (score=%.4f, params=%s)", kernel_metadata['kernel_type'], kernel_metadata['kernel_score'], kernel_metadata['kernel_params'])
+        pair_summary.attrs['kernel_metadata'] = kernel_metadata
     merged = prod_base.merge(injection_features, on=["ds", "well"], how="left")
     for column in ["inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted"]:
         if column not in merged.columns:
@@ -793,6 +854,9 @@ def prepare_model_frames(
     prod_df["type"] = prod_df.groupby("well")["type"].transform(lambda s: s.ffill().bfill())
     numeric_cols = [col for col in prod_df.columns if col not in {"ds", "well", "type"}]
     prod_df = impute_numeric(prod_df, "well", numeric_cols)
+    prod_df = _enforce_monotonic_cumulative(prod_df, "well", ["wlpt"])
+    prod_df = _clip_non_negative(prod_df, ["wlpt_diff", "wlpr", "womr", "womt"])
+    prod_df = _compute_watercut(prod_df)
     prod_df["wlpr"] = prod_df["wlpr"].fillna(0.0)
     max_dates = prod_df.groupby("well")["ds"].max()
     if max_dates.empty:
@@ -819,6 +883,8 @@ def prepare_model_frames(
         inj_raw["well"] = inj_raw["well"].astype(str)
         inj_wells = sorted(inj_raw["well"].unique())
         inj_df = reindex_series(inj_raw, inj_wells, config.freq)
+        inj_df = _enforce_monotonic_cumulative(inj_df, "well", ["wwit"])
+        inj_df = _clip_non_negative(inj_df, ["wwir", "wwit", "wwit_diff"])
     prod_df, pair_summary = _apply_injection_lag_features(
         prod_base,
         inj_df,
@@ -827,7 +893,7 @@ def prepare_model_frames(
         train_cutoff,
         distances=distances,
     )
-
+    kernel_metadata = pair_summary.attrs.get('kernel_metadata')
     logger.info("Prepared lagged injection features: %d pairs, train cutoff=%s, test start=%s", len(pair_summary), train_cutoff.date(), test_start.date())
     prod_df = _finalize_prod_dataframe(prod_df, config)
     feature_cols = set(config.hist_exog + config.futr_exog)
@@ -859,6 +925,7 @@ def prepare_model_frames(
         "test_start": test_start,
         "train_cutoff": train_cutoff,
         "injection_summary": pair_summary,
+        "kernel_metadata": kernel_metadata,
         "prod_base_df": prod_base,
         "inj_df": inj_df,
     }
@@ -1305,6 +1372,9 @@ def save_artifacts(
         "train_rows": int(len(frames["train_df"])),
         "test_rows": int(len(frames["test_df"])),
     }
+    kernel_metadata = frames.get("kernel_metadata")
+    if kernel_metadata:
+        metadata["kernel_selection"] = kernel_metadata
     inj_summary = frames.get("injection_summary")
     if isinstance(inj_summary, pd.DataFrame) and not inj_summary.empty:
         summary_path = output_dir / "injection_lag_summary.csv"
@@ -1417,4 +1487,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
