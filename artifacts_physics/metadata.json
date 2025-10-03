@@ -183,7 +183,23 @@
       "wwit_diff",
       "inj_wwir_lag_weighted",
       "inj_wwit_diff_lag_weighted",
-      "inj_wwir_crm_weighted"
+      "inj_wwir_crm_weighted",
+      "wlpr_x_wbhp",
+      "wlpr_div_wbhp",
+      "wlpr_x_inj_wwir_lag_weighted",
+      "wlpr_div_inj_wwir_lag_weighted",
+      "wlpr_ma3",
+      "wlpr_ma6",
+      "wlpr_ma12",
+      "wlpr_std3",
+      "wlpr_std6",
+      "wlpr_std12",
+      "wbhp_ma3",
+      "wbhp_ma6",
+      "wbhp_ma12",
+      "wbhp_std3",
+      "wbhp_std6",
+      "wbhp_std12"
     ],
     "futr_exog": [
       "month_sin",
@@ -201,7 +217,13 @@
     "static_exog": [
       "x",
       "y",
-      "z"
+      "z",
+      "well_depth",
+      "dist_from_center",
+      "quadrant_0",
+      "quadrant_1",
+      "quadrant_2",
+      "quadrant_3"
     ]
   },
   "target_wells": [
@@ -240,19 +262,19 @@
   "walk_forward_cv": {
     "folds": 6,
     "aggregate": {
-      "mae": 8.647028986512307,
-      "rmse": 14.942688296427356,
-      "mape": 7.336546834901646,
-      "smape": 7.536214342585037,
-      "wmape": 5.650712999755736,
-      "mase": 1.877430856093076,
-      "r2": 0.986299271415106,
-      "nse": 0.986299271415106,
-      "kge": 0.945833674303894,
-      "pbias": 2.4122988238461387,
-      "index_of_agreement": 0.9964975464430023,
-      "mean_bias_error": -3.695203563728118,
-      "correlation": 0.9954622515629604
+      "mae": 10.58779901706757,
+      "rmse": 17.49306071310349,
+      "mape": 8.577859874700481,
+      "smape": 8.530445738846543,
+      "wmape": 6.920527269901511,
+      "mase": 2.34152185755202,
+      "r2": 0.9782043746320548,
+      "nse": 0.9782043746320548,
+      "kge": 0.9140768892603812,
+      "pbias": 1.8027175468562653,
+      "index_of_agreement": 0.9947654756805774,
+      "mean_bias_error": -2.7478556988374083,
+      "correlation": 0.9955173698456564
     },
     "details_path": "artifacts_physics\\cv_metrics.json"
   }
