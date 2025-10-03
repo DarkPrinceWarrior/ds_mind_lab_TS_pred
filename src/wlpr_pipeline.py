@@ -3,10 +3,23 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import time
+from datetime import datetime
+
 try:
     from .features_injection import build_injection_lag_features
+    from .data_validation import validate_and_report, WellDataValidator
+    from .metrics_extended import calculate_all_metrics, print_metrics_summary, calculate_metrics_by_horizon
+    from .logging_config import setup_logging, log_execution_time
+    from .mlflow_tracking import create_tracker
+    from .caching import CacheManager, cached
 except ImportError:  # pragma: no cover
     from features_injection import build_injection_lag_features
+    from data_validation import validate_and_report, WellDataValidator
+    from metrics_extended import calculate_all_metrics, print_metrics_summary, calculate_metrics_by_horizon
+    from logging_config import setup_logging, log_execution_time
+    from mlflow_tracking import create_tracker
+    from caching import CacheManager, cached
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -29,6 +42,16 @@ from torch.optim.lr_scheduler import (
 
 EPSILON = 1e-6
 logger = logging.getLogger(__name__)
+
+# Global cache manager
+_cache: Optional[CacheManager] = None
+
+def get_cache() -> CacheManager:
+    """Get or create global cache manager."""
+    global _cache
+    if _cache is None:
+        _cache = CacheManager(cache_dir=Path(".cache"), enabled=True)
+    return _cache
 
 LOSS_REGISTRY: Dict[str, type] = {
     "mae": MAE,
@@ -441,7 +464,17 @@ class PipelineConfig:
 
 
 
-def load_raw_data(path: Path) -> pd.DataFrame:
+@log_execution_time(logger)
+def load_raw_data(path: Path, validate: bool = True) -> pd.DataFrame:
+    """Load and optionally validate raw well data.
+    
+    Args:
+        path: Path to CSV file
+        validate: Whether to validate data schema and quality
+    
+    Returns:
+        Loaded and preprocessed DataFrame
+    """
     df = pd.read_csv(path, sep=";")
     df = df.rename(columns={"DATA": "date", "TYPE": "type"})
     df.columns = [col.lower() for col in df.columns]
@@ -459,6 +492,16 @@ def load_raw_data(path: Path) -> pd.DataFrame:
     df = df.sort_values(["well", "date"])
     df = df.drop_duplicates(["well", "date"])
     logger.info("Loaded %d rows for %d wells", len(df), df["well"].nunique())
+    
+    # Validate if requested
+    if validate:
+        try:
+            validator = WellDataValidator()
+            df = validator.validate_schema(df)
+            logger.info("Data validation passed")
+        except Exception as exc:
+            logger.warning("Data validation failed: %s", exc)
+    
     return df
 
 
@@ -1068,12 +1111,13 @@ def train_and_forecast(frames: Dict[str, pd.DataFrame], config: PipelineConfig) 
     return preds
 
 
-def _error_metrics(
+def _error_metrics_legacy(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     insample: Optional[np.ndarray] = None,
     seasonal_period: int = 1,
 ) -> Dict[str, float]:
+    """Legacy error metrics function (kept for backward compatibility)."""
     errors = y_true - y_pred
     mae = float(np.mean(np.abs(errors)))
     rmse = float(np.sqrt(np.mean(errors ** 2)))
@@ -1144,23 +1188,54 @@ def evaluate_predictions(
     test_df: pd.DataFrame,
     train_df: pd.DataFrame,
     seasonal_period: int = 1,
+    use_extended_metrics: bool = True,
 ) -> Tuple[Dict[str, Dict[str, float]], pd.DataFrame]:
+    """Evaluate predictions with comprehensive metrics.
+    
+    Args:
+        pred_df: Predictions DataFrame
+        test_df: Test DataFrame
+        train_df: Training DataFrame
+        seasonal_period: Seasonal period for MASE
+        use_extended_metrics: Whether to use extended metrics
+    
+    Returns:
+        Tuple of (metrics dict, merged DataFrame)
+    """
     merged = merge_forecast_frame(pred_df, test_df)
-    overall = _error_metrics(
-        merged["y"].to_numpy(),
-        merged["y_hat"].to_numpy(),
-        insample=train_df["y"].to_numpy(),
-        seasonal_period=seasonal_period,
-    )
+    
+    # Calculate overall metrics
+    if use_extended_metrics:
+        overall = calculate_all_metrics(
+            merged["y"].to_numpy(),
+            merged["y_hat"].to_numpy(),
+            y_insample=train_df["y"].to_numpy(),
+            n_features=None,  # Could be passed from config
+        )
+    else:
+        overall = _error_metrics_legacy(
+            merged["y"].to_numpy(),
+            merged["y_hat"].to_numpy(),
+            insample=train_df["y"].to_numpy(),
+            seasonal_period=seasonal_period,
+        )
+    # Calculate per-well metrics
     per_well: Dict[str, Dict[str, float]] = {}
     for unique_id, group in merged.groupby("unique_id"):
         insample = train_df[train_df["unique_id"] == unique_id]["y"].to_numpy()
-        per_well[str(unique_id)] = _error_metrics(
-            group["y"].to_numpy(),
-            group["y_hat"].to_numpy(),
-            insample=insample,
-            seasonal_period=seasonal_period,
-        )
+        if use_extended_metrics:
+            per_well[str(unique_id)] = calculate_all_metrics(
+                group["y"].to_numpy(),
+                group["y_hat"].to_numpy(),
+                y_insample=insample,
+            )
+        else:
+            per_well[str(unique_id)] = _error_metrics_legacy(
+                group["y"].to_numpy(),
+                group["y_hat"].to_numpy(),
+                insample=insample,
+                seasonal_period=seasonal_period,
+            )
     metrics = {"overall": overall, "by_well": per_well, "observations": int(len(merged))}
     return metrics, merged
 
@@ -1424,22 +1499,121 @@ def parse_args() -> argparse.Namespace:
         default=Path("artifacts"),
         help="Directory to store predictions and metrics",
     )
+    parser.add_argument(
+        "--enable-mlflow",
+        action="store_true",
+        help="Enable MLflow experiment tracking",
+    )
+    parser.add_argument(
+        "--mlflow-uri",
+        type=str,
+        default=None,
+        help="MLflow tracking URI",
+    )
+    parser.add_argument(
+        "--disable-cache",
+        action="store_true",
+        help="Disable caching of intermediate results",
+    )
+    parser.add_argument(
+        "--skip-validation",
+        action="store_true",
+        help="Skip data validation",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    """Main pipeline execution function."""
     torch.set_float32_matmul_precision("high")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    
+    # Parse arguments first
     args = parse_args()
+    
+    # Setup enhanced logging
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = output_dir / "logs"
+    
+    setup_logging(
+        log_dir=log_dir,
+        level=args.log_level,
+        console=True,
+        file_logging=True,
+        rotation="size",
+        colored=True,
+    )
+    
+    start_time = time.perf_counter()
+    logger.info("="*80)
+    logger.info("Starting WLPR Forecasting Pipeline")
+    logger.info("Timestamp: %s", datetime.now().isoformat())
+    logger.info("="*80)
+    # Validate inputs
     if not args.data_path.exists():
         raise FileNotFoundError(f"Dataset not found at {args.data_path}")
     if not args.coords_path.exists():
         raise FileNotFoundError(f"Coordinate file not found at {args.coords_path}")
-    # config = PipelineConfig()
+    
+    # Initialize configuration
     config = PipelineConfig(loss="physics")
-    output_dir = args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    raw_df = load_raw_data(args.data_path)
+    
+    # Initialize cache
+    if not args.disable_cache:
+        cache = CacheManager(cache_dir=output_dir / ".cache", enabled=True)
+        global _cache
+        _cache = cache
+        logger.info("Caching enabled at: %s", cache.cache_dir)
+    else:
+        logger.info("Caching disabled")
+    
+    # Initialize MLflow tracking
+    tracker = None
+    if args.enable_mlflow:
+        tracker = create_tracker(
+            config=config,
+            run_name=f"wlpr_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            tracking_uri=args.mlflow_uri,
+        )
+        if tracker:
+            tracker.start_run()
+            tracker.log_config(config)
+            tracker.set_tags({
+                "pipeline": "wlpr_forecasting",
+                "model": "TSMixerx",
+                "physics_informed": str(config.loss == "physics"),
+            })
+            logger.info("MLflow tracking enabled")
+    # Load and validate data
+    raw_df = load_raw_data(args.data_path, validate=not args.skip_validation)
+    
+    # Generate data quality report
+    if not args.skip_validation:
+        try:
+            coords_temp = load_coordinates(args.coords_path)
+            quality_report = validate_and_report(
+                raw_df,
+                coords=coords_temp,
+                save_report=True,
+                output_path=str(output_dir),
+            )
+            
+            if tracker:
+                tracker.log_dict(quality_report.to_dict(), "data_quality_report")
+                tracker.log_metrics({
+                    "data_total_rows": quality_report.total_rows,
+                    "data_total_wells": quality_report.total_wells,
+                    "data_duplicate_rows": quality_report.duplicate_rows,
+                })
+        except Exception as exc:
+            logger.warning("Data validation failed: %s", exc)
     coords = load_coordinates(args.coords_path)
     distances = None
     if args.distances_path and args.distances_path.exists():
@@ -1450,18 +1624,51 @@ def main() -> None:
             args.distances_path,
         )
     frames = prepare_model_frames(raw_df, coords, config, distances=distances)
+    # Run walk-forward validation
     cv_results = run_walk_forward_validation(
         frames,
         coords,
         config,
         distances=distances,
     )
+    
+    # Log CV results to MLflow
+    if tracker and cv_results:
+        tracker.log_dict(cv_results, "cv_results")
+        if "aggregate" in cv_results and cv_results["aggregate"]:
+            tracker.log_metrics(
+                {f"cv_{k}": v for k, v in cv_results["aggregate"].items() if v is not None},
+                step=0,
+            )
     preds = train_and_forecast(frames, config)
+    # Evaluate with extended metrics
     metrics, merged = evaluate_predictions(
         preds,
         frames["test_df"],
         frames["train_df"],
+        use_extended_metrics=True,
     )
+    
+    # Print comprehensive metrics summary
+    print_metrics_summary(metrics["overall"], "Overall Test Metrics")
+    
+    # Calculate horizon-specific metrics
+    horizon_metrics = calculate_metrics_by_horizon(merged, config.horizon)
+    logger.info("Horizon-specific metrics calculated for %d steps", len(horizon_metrics))
+    
+    # Log to MLflow
+    if tracker:
+        # Log overall metrics
+        overall_flat = {f"test_{k}": v for k, v in metrics["overall"].items() if v is not None}
+        tracker.log_metrics(overall_flat, step=1)
+        
+        # Log horizon metrics
+        for step, step_metrics in horizon_metrics.items():
+            step_flat = {f"horizon_{step}_{k}": v for k, v in step_metrics.items() if v is not None}
+            tracker.log_metrics(step_flat, step=step)
+        
+        # Log well-level metrics
+        tracker.log_dict(metrics, "test_metrics_detailed")
     forecast_pdf = generate_forecast_pdf(merged, metrics, output_dir)
     full_history_pdf = generate_full_history_pdf(frames, merged, metrics, config, output_dir)
     residuals_pdf = generate_residuals_pdf(merged, metrics, output_dir)
@@ -1470,6 +1677,7 @@ def main() -> None:
         "full_history": str(full_history_pdf),
         "residuals": str(residuals_pdf),
     }
+    # Save artifacts
     save_artifacts(
         preds,
         metrics,
@@ -1479,10 +1687,37 @@ def main() -> None:
         pdf_paths=pdf_paths,
         cv_results=cv_results,
     )
-    logger.info("Pipeline complete. Overall metrics: %s", metrics["overall"])
+    
+    # Log artifacts to MLflow
+    if tracker:
+        for name, path in pdf_paths.items():
+            tracker.log_artifact(Path(path), "reports")
+        
+        tracker.log_artifact(output_dir / "metrics.json", "metrics")
+        tracker.log_artifact(output_dir / "metadata.json", "metadata")
+        tracker.log_artifact(output_dir / "wlpr_predictions.csv", "predictions")
+        
+        if (output_dir / "injection_lag_summary.csv").exists():
+            tracker.log_artifact(output_dir / "injection_lag_summary.csv", "features")
+    
+    # Final summary
+    elapsed = time.perf_counter() - start_time
+    logger.info("="*80)
+    logger.info("Pipeline completed successfully")
+    logger.info("Total execution time: %.2f seconds (%.2f minutes)", elapsed, elapsed / 60)
+    logger.info("Overall metrics: %s", {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in metrics["overall"].items() if v is not None})
+    
     if cv_results and cv_results.get("aggregate"):
-        logger.info("Walk-forward CV aggregate metrics: %s", cv_results["aggregate"])
-    logger.info("Forecast reports saved: %s", pdf_paths)
+        logger.info("Walk-forward CV aggregate: %s", {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in cv_results["aggregate"].items() if v is not None})
+    
+    logger.info("Artifacts saved to: %s", output_dir)
+    logger.info("Forecast reports: %s", list(pdf_paths.keys()))
+    logger.info("="*80)
+    
+    # Cleanup MLflow
+    if tracker:
+        tracker.end_run()
+        logger.info("MLflow run completed: %s", tracker.run_id)
 
 
 if __name__ == "__main__":

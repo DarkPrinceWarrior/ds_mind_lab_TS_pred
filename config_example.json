@@ -1,0 +1,145 @@
+{
+  "pipeline": {
+    "name": "WLPR Forecasting",
+    "version": "2.0",
+    "description": "Physics-informed TSMixerx for well production forecasting"
+  },
+  
+  "data": {
+    "data_path": "MODEL_22.09.25.csv",
+    "coords_path": "coords.txt",
+    "distances_path": "well_distances.xlsx",
+    "validation_enabled": true,
+    "min_history": 60,
+    "freq": "MS"
+  },
+  
+  "model": {
+    "horizon": 6,
+    "input_size": 48,
+    "n_block": 2,
+    "ff_dim": 64,
+    "dropout": 0.1,
+    "learning_rate": 0.0005,
+    "max_steps": 250,
+    "batch_size": 16,
+    "scaler_type": "standard"
+  },
+  
+  "physics": {
+    "enabled": true,
+    "loss_type": "physics",
+    "physics_weight": 0.1,
+    "injection_coeff": 0.05,
+    "damping": 0.01,
+    "smoothing_weight": 0.0,
+    "features": ["inj_wwir_lag_weighted"],
+    "base_loss": "huber"
+  },
+  
+  "injection_features": {
+    "top_k": 5,
+    "kernel_type": "idw",
+    "kernel_p": 2.0,
+    "calibrate": true,
+    "use_crm": true,
+    "tau_bound_multiplier": 2.0,
+    "kernel_candidates": [
+      {
+        "type": "idw",
+        "calibrate": true,
+        "params": {"p": 1.5},
+        "param_grid": {"p": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]}
+      },
+      {
+        "type": "exponential",
+        "calibrate": true,
+        "params": {"scale": 400.0},
+        "param_grid": {"scale": [200.0, 400.0, 600.0, 800.0, 1000.0]}
+      },
+      {
+        "type": "gaussian",
+        "calibrate": true,
+        "params": {"scale": 400.0},
+        "param_grid": {"scale": [200.0, 400.0, 600.0, 800.0, 1000.0]}
+      }
+    ]
+  },
+  
+  "validation": {
+    "cv_enabled": true,
+    "cv_folds": 6,
+    "cv_step": 6,
+    "val_horizon": 6,
+    "early_stop_patience_steps": 50,
+    "val_check_steps": 20
+  },
+  
+  "optimizer": {
+    "name": "adamw",
+    "weight_decay": 0.0001,
+    "kwargs": {
+      "betas": [0.9, 0.99]
+    }
+  },
+  
+  "scheduler": {
+    "name": "onecycle",
+    "kwargs": {
+      "pct_start": 0.3,
+      "div_factor": 10.0
+    }
+  },
+  
+  "features": {
+    "hist_exog": [
+      "wlpt", "womt", "womr", "wwir", "wwit", "wthp", "wbhp",
+      "wlpt_diff", "womt_diff", "wwit_diff",
+      "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted"
+    ],
+    "futr_exog": [
+      "month_sin", "month_cos", "time_idx", "type_prod", "type_inj",
+      "wwir", "wwit", "wwit_diff",
+      "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted"
+    ],
+    "static_exog": ["x", "y", "z"]
+  },
+  
+  "output": {
+    "output_dir": "artifacts",
+    "save_predictions": true,
+    "save_metrics": true,
+    "save_metadata": true,
+    "generate_reports": true
+  },
+  
+  "logging": {
+    "level": "INFO",
+    "console": true,
+    "file_logging": true,
+    "rotation": "size",
+    "max_bytes": 10485760,
+    "backup_count": 5,
+    "colored": true
+  },
+  
+  "mlflow": {
+    "enabled": false,
+    "tracking_uri": "file:./mlruns",
+    "experiment_name": "wlpr_forecasting",
+    "run_name": null
+  },
+  
+  "caching": {
+    "enabled": true,
+    "cache_dir": ".cache"
+  },
+  
+  "hardware": {
+    "accelerator": "auto",
+    "devices": 1,
+    "precision": "16-mixed",
+    "num_workers": 0,
+    "pin_memory": false
+  }
+}
