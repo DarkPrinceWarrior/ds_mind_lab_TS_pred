@@ -3,6 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+try:
+    from .features_injection import build_injection_lag_features
+except ImportError:  # pragma: no cover
+    from features_injection import build_injection_lag_features
+
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
@@ -360,8 +365,14 @@ class PipelineConfig:
     physics_injection_coeff: float = 0.05
     physics_damping: float = 0.01
     physics_smoothing_weight: float = 0.0
-    physics_features: List[str] = field(default_factory=lambda: ['inj_wwir_weighted'])
+    physics_features: List[str] = field(default_factory=lambda: ["inj_wwir_lag_weighted"])
     physics_base_loss: str = "huber"
+    inj_top_k: int = 5
+    inj_kernel_p: float = 2.0
+    use_crm_filter: bool = True
+    tau_bound_multiplier: float = 2.0
+    lag_min_overlap: int = 6
+    physics_estimates: Optional[Dict[str, float]] = None
     optimizer_name: Optional[str] = "adamw"
     optimizer_kwargs: Dict[str, Any] = field(default_factory=lambda: {"betas": (0.9, 0.99)})
     lr_scheduler_name: Optional[str] = "onecycle"
@@ -389,20 +400,9 @@ class PipelineConfig:
             "wlpt_diff",
             "womt_diff",
             "wwit_diff",
-            "inj_wwir_weighted",
-            "inj_wwir_weighted_lag1",
-            "inj_wwir_weighted_lag3",
-            "inj_wwir_weighted_lag6",
-            "inj_wwir_weighted_roll3",
-            "inj_wwir_weighted_roll6",
-            "inj_wwit_diff_weighted",
-            "inj_wwit_diff_weighted_lag1",
-            "wwir_lag1",
-            "wwir_lag3",
-            "wwir_lag6",
-            "wwir_roll3",
-            "wwir_roll6",
-            "wwit_diff_lag1",
+            "inj_wwir_lag_weighted",
+            "inj_wwit_diff_lag_weighted",
+            "inj_wwir_crm_weighted",
         ]
     )
     futr_exog: List[str] = field(
@@ -412,20 +412,12 @@ class PipelineConfig:
             "time_idx",
             "type_prod",
             "type_inj",
-            "inj_wwir_weighted",
-            "inj_wwir_weighted_lag1",
-            "inj_wwir_weighted_lag3",
-            "inj_wwir_weighted_lag6",
-            "inj_wwir_weighted_roll3",
-            "inj_wwir_weighted_roll6",
-            "inj_wwit_diff_weighted",
-            "inj_wwit_diff_weighted_lag1",
-            "wwir_lag1",
-            "wwir_lag3",
-            "wwir_lag6",
-            "wwir_roll3",
-            "wwir_roll6",
-            "wwit_diff_lag1",
+            "wwir",
+            "wwit",
+            "wwit_diff",
+            "inj_wwir_lag_weighted",
+            "inj_wwit_diff_lag_weighted",
+            "inj_wwir_crm_weighted",
         ]
     )
     static_exog: List[str] = field(default_factory=lambda: ["x", "y", "z"])
@@ -526,21 +518,6 @@ def reindex_series(df: pd.DataFrame, wells: List[str], freq: str) -> pd.DataFram
     return pd.concat(frames, ignore_index=True)
 
 
-def _zero_injection_features(date_index: pd.DatetimeIndex, wells: List[str]) -> pd.DataFrame:
-    if not wells or len(date_index) == 0:
-        return pd.DataFrame(columns=["ds", "well", "inj_wwir_weighted", "inj_wwit_diff_weighted"])
-    repeats = len(date_index)
-    tiles = len(wells)
-    return pd.DataFrame(
-        {
-            "ds": np.repeat(date_index.values, tiles),
-            "well": np.tile(wells, repeats),
-            "inj_wwir_weighted": 0.0,
-            "inj_wwit_diff_weighted": 0.0,
-        }
-    )
-
-
 def generate_walk_forward_splits(
     train_df: pd.DataFrame,
     horizon: int,
@@ -610,10 +587,18 @@ def generate_walk_forward_splits(
 
 
 def run_walk_forward_validation(
-    train_df: pd.DataFrame,
-    static_df: pd.DataFrame,
+    frames: Dict[str, pd.DataFrame],
+    coords: pd.DataFrame,
     config: PipelineConfig,
+    distances: Optional[pd.DataFrame] = None,
 ) -> Optional[Dict[str, object]]:
+    train_df = frames["train_df"]
+    static_df = frames["static_df"]
+    prod_base_df = frames.get("prod_base_df")
+    inj_df = frames.get("inj_df")
+    if prod_base_df is None or inj_df is None:
+        logger.warning("Missing base data for injection features; using cached features for CV folds.")
+
     if not config.cv_enabled:
         return None
     try:
@@ -633,21 +618,59 @@ def run_walk_forward_validation(
     metric_sums: Dict[str, float] = {}
     metric_weights: Dict[str, float] = {}
     futr_columns = ["unique_id", "ds"] + config.futr_exog
+    feature_cols = set(config.hist_exog + config.futr_exog)
+    train_columns = list(train_df.columns)
     for split in splits:
-        model = _create_model(config, n_series=train_df["unique_id"].nunique())
+        fold_train_raw = split["train_df"]
+        fold_val_raw = split["val_df"]
+        cutoff_date = fold_train_raw["ds"].max() if not fold_train_raw.empty else None
+        fold_pair_summary: Optional[pd.DataFrame] = None
+        if cutoff_date is None:
+            logger.warning("Skipping fold %s due to empty training window.", split["fold"])
+            continue
+        if prod_base_df is not None and inj_df is not None:
+            fold_prod, fold_pair_summary = _apply_injection_lag_features(
+                prod_base_df,
+                inj_df,
+                coords,
+                config,
+                cutoff_date,
+                distances=distances,
+            )
+            fold_prod = _finalize_prod_dataframe(fold_prod, config)
+            missing_fold_features = [col for col in feature_cols if col not in fold_prod.columns]
+            if missing_fold_features:
+                raise ValueError(
+                    f"Fold {split['fold']} missing required features: {missing_fold_features}"
+                )
+            train_keys = fold_train_raw[["unique_id", "ds"]].drop_duplicates()
+            val_keys = fold_val_raw[["unique_id", "ds"]].drop_duplicates()
+            fold_prod = fold_prod.sort_values(["unique_id", "ds"])
+            fold_train = fold_prod.merge(
+                train_keys.assign(__flag=1), on=["unique_id", "ds"], how="inner"
+            ).drop(columns="__flag")
+            fold_val = fold_prod.merge(
+                val_keys.assign(__flag=1), on=["unique_id", "ds"], how="inner"
+            ).drop(columns="__flag")
+            fold_train = fold_train[train_columns]
+            fold_val = fold_val[train_columns]
+        else:
+            fold_train = fold_train_raw
+            fold_val = fold_val_raw
+        model = _create_model(config, n_series=fold_train["unique_id"].nunique())
         nf = NeuralForecast(models=[model], freq=config.freq)
         nf.fit(
-            df=split["train_df"],
+            df=fold_train,
             static_df=static_df,
             val_size=config.val_horizon,
         )
-        fold_futr = split["val_df"][futr_columns].copy()
+        fold_futr = fold_val[futr_columns].copy()
         preds = nf.predict(futr_df=fold_futr, static_df=static_df)
         preds = preds.rename(columns={"tsmixerx_wlpr": "y_hat"})
         metrics, merged = evaluate_predictions(
             preds,
-            split["val_df"],
-            split["train_df"],
+            fold_val,
+            fold_train,
         )
         overall_raw = metrics.get("overall", {})
         overall: Dict[str, Optional[float]] = {}
@@ -658,14 +681,14 @@ def run_walk_forward_validation(
                 overall[key] = None
         rows = len(merged)
         train_end_obs = int(split["train_cutoff"]) + 1
-        val_start_obs = int(split["val_start"]) + 1
+        val_start_obs = int(split["val_start"] ) + 1
         val_end_obs = int(split["val_end"]) + 1
         fold_results.append(
             {
                 "fold": int(split["fold"]),
                 "train_span": [1, train_end_obs],
                 "val_span": [val_start_obs, val_end_obs],
-                "train_rows": int(len(split["train_df"])),
+                "train_rows": int(len(fold_train)),
                 "rows": int(rows),
                 "indices": {
                     "train_end_idx": int(split["train_cutoff"]),
@@ -673,6 +696,7 @@ def run_walk_forward_validation(
                     "val_end_idx": int(split["val_end"]),
                 },
                 "metrics": overall,
+                "lag_pairs": int(len(fold_pair_summary)) if isinstance(fold_pair_summary, pd.DataFrame) else None,
             }
         )
         logger.info(
@@ -698,154 +722,57 @@ def run_walk_forward_validation(
     return {"folds": fold_results, "aggregate": aggregate}
 
 
-def build_injection_features(
-    raw_df: pd.DataFrame,
+
+def _apply_injection_lag_features(
+    prod_base: pd.DataFrame,
+    inj_df: pd.DataFrame,
     coords: pd.DataFrame,
-    prod_wells: List[str],
-    date_index: pd.DatetimeIndex,
+    config: PipelineConfig,
+    train_cutoff: pd.Timestamp,
+    *,
     distances: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
-    inj_df = raw_df[raw_df["type"] == "INJ"].copy()
-    if inj_df.empty or not prod_wells:
-        return _zero_injection_features(date_index, prod_wells)
-    inj_df = inj_df[["date", "well", "wwir", "wwit_diff"]].copy()
-    inj_df["well"] = inj_df["well"].astype(str)
-    inj_df = inj_df.dropna(subset=["date", "well"])
-    inj_df = inj_df.sort_values(["well", "date"])
-    inj_df = inj_df.drop_duplicates(["well", "date"])
-    if inj_df.empty:
-        return _zero_injection_features(date_index, prod_wells)
-    inj_wells = sorted(inj_df["well"].unique())
-    rate_wide = (
-        inj_df.pivot(index="date", columns="well", values="wwir")
-        .reindex(date_index)
-        .fillna(0.0)
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    injection_features, pair_summary = build_injection_lag_features(
+        prod_base,
+        inj_df,
+        coords,
+        freq=config.freq,
+        train_cutoff=train_cutoff,
+        distances=distances,
+        physics_estimates=config.physics_estimates,
+        topK=config.inj_top_k,
+        kernel_p=config.inj_kernel_p,
+        use_crm=config.use_crm_filter,
+        tau_bound_multiplier=config.tau_bound_multiplier,
+        min_overlap=config.lag_min_overlap,
     )
-    diff_wide = (
-        inj_df.pivot(index="date", columns="well", values="wwit_diff")
-        .reindex(date_index)
-        .fillna(0.0)
-    )
-    rate_wide.index = rate_wide.index.rename("ds")
-    diff_wide.index = diff_wide.index.rename("ds")
-    coords_idx = coords.set_index("well")
-    missing_prod = [well for well in prod_wells if well not in coords_idx.index]
-    if missing_prod:
-        raise ValueError(f"Missing coordinates for producer wells: {missing_prod}")
-
-    distance_matrix = distances if distances is not None else None
-    if distance_matrix is not None:
-        missing_prod_in_matrix = [
-            well
-            for well in prod_wells
-            if well not in distance_matrix.index and well not in distance_matrix.columns
-        ]
-        missing_inj_in_matrix = [
-            well
-            for well in inj_wells
-            if well not in distance_matrix.index and well not in distance_matrix.columns
-        ]
-        if missing_prod_in_matrix:
-            logger.warning(
-                "Distance matrix missing producer wells %s. Falling back to coordinate distances.",
-                missing_prod_in_matrix,
-            )
-        if missing_inj_in_matrix:
-            logger.warning(
-                "Distance matrix missing injector wells %s. Falling back to coordinate distances.",
-                missing_inj_in_matrix,
-            )
-
-    def _lookup_distance(prod: str, inj: str) -> float:
-        if distance_matrix is not None:
-            value = np.nan
-            if prod in distance_matrix.index and inj in distance_matrix.columns:
-                value = distance_matrix.at[prod, inj]
-            elif inj in distance_matrix.index and prod in distance_matrix.columns:
-                value = distance_matrix.at[inj, prod]
-            if pd.notna(value):
-                return float(value)
-        if inj not in coords_idx.index:
-            raise ValueError(f"Missing coordinates for injector well {inj}")
-        prod_vec = coords_idx.loc[prod, ["x", "y", "z"]].to_numpy(dtype=float)
-        inj_vec = coords_idx.loc[inj, ["x", "y", "z"]].to_numpy(dtype=float)
-        return float(np.linalg.norm(prod_vec - inj_vec))
-
-    weight_rows: List[np.ndarray] = []
-    for prod in prod_wells:
-        weights: List[float] = []
-        for inj in inj_wells:
-            dist = _lookup_distance(prod, inj)
-            if dist <= 0.0:
-                weight = 1.0
-            else:
-                dist = max(dist, EPSILON)
-                weight = 1.0 / (dist ** 2)
-            weights.append(weight)
-        weights_arr = np.array(weights, dtype=float)
-        total = float(weights_arr.sum())
-        if not np.isfinite(total) or total <= 0.0:
-            weights_arr = np.full_like(weights_arr, 1.0 / len(weights_arr))
-        else:
-            weights_arr = weights_arr / total
-        weight_rows.append(weights_arr)
-    weight_matrix = np.vstack(weight_rows)  # (n_prod, n_inj)
-    weighted_rate = rate_wide.to_numpy() @ weight_matrix.T
-    weighted_diff = diff_wide.to_numpy() @ weight_matrix.T
-    rate_df = (
-        pd.DataFrame(weighted_rate, index=rate_wide.index, columns=prod_wells)
-        .stack()
-        .rename("inj_wwir_weighted")
-        .reset_index()
-    )
-    diff_df = (
-        pd.DataFrame(weighted_diff, index=diff_wide.index, columns=prod_wells)
-        .stack()
-        .rename("inj_wwit_diff_weighted")
-        .reset_index()
-    )
-    rate_df = rate_df.rename(columns={"level_1": "well"})
-    diff_df = diff_df.rename(columns={"level_1": "well"})
-    features = rate_df.merge(diff_df, on=["ds", "well"], how="left")
-    return features
+    merged = prod_base.merge(injection_features, on=["ds", "well"], how="left")
+    for column in ["inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted"]:
+        if column not in merged.columns:
+            merged[column] = 0.0
+    merged[["inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted"]] = merged[["inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted"]].fillna(0.0)
+    return merged, pair_summary
 
 
-def add_lag_features(
-    df: pd.DataFrame, group_col: str, columns: List[str], lags: List[int]
-) -> List[str]:
-    new_columns: List[str] = []
-    for col in columns:
-        if col not in df.columns:
-            continue
-        for lag in lags:
-            new_col = f"{col}_lag{lag}"
-            df[new_col] = df.groupby(group_col)[col].shift(lag)
-            new_columns.append(new_col)
-    return new_columns
-
-
-def add_rolling_features(
-    df: pd.DataFrame, group_col: str, columns: List[str], windows: List[int]
-) -> List[str]:
-    new_columns: List[str] = []
-    for col in columns:
-        if col not in df.columns:
-            continue
-        for window in windows:
-            new_col = f"{col}_roll{window}"
-            df[new_col] = (
-                df.groupby(group_col)[col]
-                .transform(lambda series: series.rolling(window, min_periods=1).mean())
-            )
-            new_columns.append(new_col)
-    return new_columns
+def _finalize_prod_dataframe(prod_df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
+    df = prod_df.copy()
+    df["type_prod"] = (df["type"] == "PROD").astype(int)
+    df["type_inj"] = (df["type"] == "INJ").astype(int)
+    df["month"] = df["ds"].dt.month
+    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12.0)
+    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12.0)
+    df["time_idx"] = df.sort_values("ds").groupby("well").cumcount()
+    df["unique_id"] = df["well"]
+    df["y"] = df["wlpr"].astype(float)
+    df = df.drop(columns=["type"], errors="ignore")
+    return df
 
 
 def impute_numeric(df: pd.DataFrame, group_col: str, columns: List[str]) -> pd.DataFrame:
     for col in columns:
         if col not in df.columns:
             continue
-        df[col] = df.groupby(group_col)[col].transform(lambda series: series.ffill().bfill())
+        df[col] = df.groupby(group_col)[col].transform(lambda series: series.ffill())
     df[columns] = df[columns].fillna(0.0)
     return df
 
@@ -867,55 +794,46 @@ def prepare_model_frames(
     numeric_cols = [col for col in prod_df.columns if col not in {"ds", "well", "type"}]
     prod_df = impute_numeric(prod_df, "well", numeric_cols)
     prod_df["wlpr"] = prod_df["wlpr"].fillna(0.0)
-    date_index = pd.date_range(prod_df["ds"].min(), prod_df["ds"].max(), freq=config.freq)
-    inj_features = build_injection_features(
-        raw_df,
+    max_dates = prod_df.groupby("well")["ds"].max()
+    if max_dates.empty:
+        raise ValueError("Could not compute terminal dates for producers.")
+    target_end = max_dates.min()
+    offset = pd.tseries.frequencies.to_offset(config.freq)
+    if offset is None:
+        raise ValueError(f"Unsupported frequency alias: {config.freq}")
+    if config.horizon <= 0:
+        raise ValueError("Forecast horizon must be positive.")
+    test_start = target_end - offset * max(config.horizon - 1, 0)
+    train_cutoff = test_start - offset
+    min_date = prod_df["ds"].min()
+    if pd.isna(min_date):
+        raise ValueError("Producer dataframe has no valid dates after preprocessing.")
+    if train_cutoff < min_date:
+        train_cutoff = min_date
+
+    prod_base = prod_df.copy()
+    inj_raw = raw_df[raw_df["type"] == "INJ"].copy()
+    if inj_raw.empty:
+        inj_df = pd.DataFrame(columns=["ds", "well", "wwir", "wwit", "wwit_diff"])
+    else:
+        inj_raw["well"] = inj_raw["well"].astype(str)
+        inj_wells = sorted(inj_raw["well"].unique())
+        inj_df = reindex_series(inj_raw, inj_wells, config.freq)
+    prod_df, pair_summary = _apply_injection_lag_features(
+        prod_base,
+        inj_df,
         coords,
-        target_wells,
-        date_index,
+        config,
+        train_cutoff,
         distances=distances,
     )
-    prod_df = prod_df.merge(inj_features, on=["ds", "well"], how="left")
-    prod_df[["inj_wwir_weighted", "inj_wwit_diff_weighted"]] = prod_df[[
-        "inj_wwir_weighted",
-        "inj_wwit_diff_weighted",
-    ]].fillna(0.0)
-    lag_spec = {
-        "inj_wwir_weighted": [1, 3, 6],
-        "inj_wwit_diff_weighted": [1],
-        "wwir": [1, 3, 6],
-        "wwit_diff": [1],
-    }
-    lagged_cols: List[str] = []
-    for col, lags in lag_spec.items():
-        lagged_cols.extend(add_lag_features(prod_df, "well", [col], lags))
-    if lagged_cols:
-        prod_df[lagged_cols] = prod_df[lagged_cols].fillna(0.0)
-    rolling_spec = {
-        "inj_wwir_weighted": [3, 6],
-        "wwir": [3, 6],
-    }
-    rolling_cols: List[str] = []
-    for col, windows in rolling_spec.items():
-        rolling_cols.extend(add_rolling_features(prod_df, "well", [col], windows))
-    if rolling_cols:
-        prod_df[rolling_cols] = prod_df[rolling_cols].fillna(0.0)
-    prod_df["type_prod"] = (prod_df["type"] == "PROD").astype(int)
-    prod_df["type_inj"] = (prod_df["type"] == "INJ").astype(int)
-    prod_df["month"] = prod_df["ds"].dt.month
-    prod_df["month_sin"] = np.sin(2 * np.pi * prod_df["month"] / 12.0)
-    prod_df["month_cos"] = np.cos(2 * np.pi * prod_df["month"] / 12.0)
-    prod_df["time_idx"] = prod_df.sort_values("ds").groupby("well").cumcount()
-    prod_df["unique_id"] = prod_df["well"]
-    prod_df["y"] = prod_df["wlpr"].astype(float)
-    prod_df = prod_df.drop(columns=["type"], errors="ignore")
+
+    logger.info("Prepared lagged injection features: %d pairs, train cutoff=%s, test start=%s", len(pair_summary), train_cutoff.date(), test_start.date())
+    prod_df = _finalize_prod_dataframe(prod_df, config)
     feature_cols = set(config.hist_exog + config.futr_exog)
     missing_features = [col for col in feature_cols if col not in prod_df.columns]
     if missing_features:
         raise ValueError(f"Missing required features: {missing_features}")
-    max_dates = prod_df.groupby("unique_id")["ds"].max()
-    target_end = max_dates.min()
-    test_start = target_end - pd.DateOffset(months=config.horizon - 1)
     train_df = prod_df[prod_df["ds"] < test_start].copy()
     test_df = prod_df[prod_df["ds"] >= test_start].copy()
     if train_df.empty or test_df.empty:
@@ -939,6 +857,10 @@ def prepare_model_frames(
         "static_df": static_df,
         "target_wells": target_wells,
         "test_start": test_start,
+        "train_cutoff": train_cutoff,
+        "injection_summary": pair_summary,
+        "prod_base_df": prod_base,
+        "inj_df": inj_df,
     }
 
 
@@ -1379,9 +1301,16 @@ def save_artifacts(
         "config": asdict(config),
         "target_wells": frames["target_wells"],
         "test_start": frames["test_start"].strftime("%Y-%m-%d"),
+        "train_cutoff": frames.get("train_cutoff").strftime("%Y-%m-%d") if isinstance(frames.get("train_cutoff"), pd.Timestamp) else None,
         "train_rows": int(len(frames["train_df"])),
         "test_rows": int(len(frames["test_df"])),
     }
+    inj_summary = frames.get("injection_summary")
+    if isinstance(inj_summary, pd.DataFrame) and not inj_summary.empty:
+        summary_path = output_dir / "injection_lag_summary.csv"
+        inj_summary.to_csv(summary_path, index=False)
+        metadata["injection_summary_path"] = str(summary_path)
+        metadata["injection_pairs"] = int(len(inj_summary))
     if pdf_paths:
         metadata["pdf_reports"] = {key: str(value) for key, value in pdf_paths.items()}
     if cv_results:
@@ -1452,9 +1381,10 @@ def main() -> None:
         )
     frames = prepare_model_frames(raw_df, coords, config, distances=distances)
     cv_results = run_walk_forward_validation(
-        frames["train_df"],
-        frames["static_df"],
+        frames,
+        coords,
         config,
+        distances=distances,
     )
     preds = train_and_forecast(frames, config)
     metrics, merged = evaluate_predictions(
@@ -1487,3 +1417,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
