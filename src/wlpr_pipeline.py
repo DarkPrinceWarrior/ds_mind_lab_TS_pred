@@ -45,8 +45,6 @@ import numpy as np
 import pandas as pd
 from neuralforecast import NeuralForecast
 from neuralforecast.models.tsmixerx import TSMixerx
-from neuralforecast.models.tft import TFT
-from neuralforecast.models.xlstm import xLSTM
 from neuralforecast.losses.pytorch import BasePointLoss, HuberLoss, MAE, MAPE, MSE, SMAPE
 import torch
 from torch.optim import Adam, AdamW, Optimizer, SGD
@@ -400,8 +398,8 @@ class PipelineConfig:
     freq: str = "MS"
     min_history: int = 60
     input_size: int = 48
-    n_block: int = 2
-    ff_dim: int = 64
+    n_block: int = 3
+    ff_dim: int = 256
     dropout: float = 0.1
     learning_rate: float = 5e-4
     max_steps: int = 250
@@ -458,13 +456,8 @@ class PipelineConfig:
     preprocessing_outlier_contamination: float = 0.05
     preprocessing_smooth_window_length: int = 7
     preprocessing_smooth_polyorder: int = 2
-    # PHASE 2: Ensemble and Advanced Architectures
-    model_type: str = "ensemble"  # "single", "ensemble", "multiscale"
-    ensemble_mode: str = "weighted"  # "average", "weighted", "stacking"
-    ensemble_weights: Optional[List[float]] = None  # Auto-calculated if None
-    ensemble_n_models: int = 3  # Number of models in ensemble (TSMixerx, TFT, xLSTM)
-    use_multiscale_in_ensemble: bool = False  # Not used anymore
-    multiscale_scales: List[int] = field(default_factory=lambda: [1, 3, 12])  # Short, medium, long-term scales
+    # PHASE 2: Single TSMixerx Model
+    model_type: str = "single"
     trainer_kwargs: Dict[str, Any] = field(
         default_factory=lambda: {
             "accelerator": "gpu" if torch.cuda.is_available() else "auto",
@@ -1374,116 +1367,6 @@ def _create_single_tsmixer(
     return model_cls(**filtered_kwargs, **trainer_kwargs)
 
 
-def _create_tft_model(
-    config: PipelineConfig,
-    n_series: int,
-    model_loss: Any,
-    valid_loss_instance: Optional[Any],
-    optimizer_cls: Optional[Type[Optimizer]],
-    optimizer_kwargs: Dict[str, Any],
-    scheduler_cls: Optional[Type[LRScheduler]],
-    scheduler_kwargs: Dict[str, Any],
-    **override_kwargs: Any,
-) -> TFT:
-    """Helper function to create a TFT (Temporal Fusion Transformer) model."""
-    base_kwargs: Dict[str, Any] = {
-        "h": config.horizon,
-        "input_size": config.input_size,
-        "n_series": n_series,
-        "futr_exog_list": config.futr_exog,
-        "hist_exog_list": config.hist_exog,
-        "stat_exog_list": config.static_exog,
-        "hidden_size": override_kwargs.get("hidden_size", 128),
-        "dropout": override_kwargs.get("dropout", config.dropout),
-        "n_head": override_kwargs.get("n_head", 4),
-        "learning_rate": config.learning_rate,
-        "max_steps": config.max_steps,
-        "early_stop_patience_steps": config.early_stop_patience_steps,
-        "val_check_steps": config.val_check_steps,
-        "batch_size": config.batch_size,
-        "windows_batch_size": config.windows_batch_size,
-        "scaler_type": config.scaler_type,
-        "random_seed": config.random_seed,
-        "alias": override_kwargs.get("alias", "tft_wlpr"),
-        "loss": model_loss,
-        "valid_loss": valid_loss_instance,
-        "valid_batch_size": config.valid_batch_size,
-        "inference_windows_batch_size": config.inference_windows_batch_size,
-        "optimizer": optimizer_cls,
-        "lr_scheduler": scheduler_cls,
-        "lr_scheduler_kwargs": scheduler_kwargs or None,
-        "dataloader_kwargs": config.dataloader_kwargs or None,
-    }
-    
-    if optimizer_kwargs:
-        base_kwargs["optimizer_kwargs"] = optimizer_kwargs
-    
-    trainer_kwargs = dict(config.trainer_kwargs) if config.trainer_kwargs else {}
-    conflicts = set(base_kwargs).intersection(trainer_kwargs)
-    if conflicts:
-        raise ValueError(
-            "trainer_kwargs override protected arguments: " + ", ".join(sorted(conflicts))
-        )
-    
-    filtered_kwargs = {key: value for key, value in base_kwargs.items() if value is not None}
-    return TFT(**filtered_kwargs, **trainer_kwargs)
-
-
-def _create_xlstm_model(
-    config: PipelineConfig,
-    n_series: int,
-    model_loss: Any,
-    valid_loss_instance: Optional[Any],
-    optimizer_cls: Optional[Type[Optimizer]],
-    optimizer_kwargs: Dict[str, Any],
-    scheduler_cls: Optional[Type[LRScheduler]],
-    scheduler_kwargs: Dict[str, Any],
-    **override_kwargs: Any,
-) -> xLSTM:
-    """Helper function to create an xLSTM model."""
-    base_kwargs: Dict[str, Any] = {
-        "h": config.horizon,
-        "input_size": config.input_size,
-        "n_series": n_series,
-        "futr_exog_list": config.futr_exog,
-        "hist_exog_list": config.hist_exog,
-        "stat_exog_list": config.static_exog,
-        "hidden_size": override_kwargs.get("hidden_size", 128),
-        "num_layers": override_kwargs.get("num_layers", 2),
-        "dropout": override_kwargs.get("dropout", config.dropout),
-        "learning_rate": config.learning_rate,
-        "max_steps": config.max_steps,
-        "early_stop_patience_steps": config.early_stop_patience_steps,
-        "val_check_steps": config.val_check_steps,
-        "batch_size": config.batch_size,
-        "windows_batch_size": config.windows_batch_size,
-        "scaler_type": config.scaler_type,
-        "random_seed": config.random_seed,
-        "alias": override_kwargs.get("alias", "xlstm_wlpr"),
-        "loss": model_loss,
-        "valid_loss": valid_loss_instance,
-        "valid_batch_size": config.valid_batch_size,
-        "inference_windows_batch_size": config.inference_windows_batch_size,
-        "optimizer": optimizer_cls,
-        "lr_scheduler": scheduler_cls,
-        "lr_scheduler_kwargs": scheduler_kwargs or None,
-        "dataloader_kwargs": config.dataloader_kwargs or None,
-    }
-    
-    if optimizer_kwargs:
-        base_kwargs["optimizer_kwargs"] = optimizer_kwargs
-    
-    trainer_kwargs = dict(config.trainer_kwargs) if config.trainer_kwargs else {}
-    conflicts = set(base_kwargs).intersection(trainer_kwargs)
-    if conflicts:
-        raise ValueError(
-            "trainer_kwargs override protected arguments: " + ", ".join(sorted(conflicts))
-        )
-    
-    filtered_kwargs = {key: value for key, value in base_kwargs.items() if value is not None}
-    return xLSTM(**filtered_kwargs, **trainer_kwargs)
-
-
 def _create_model(config: PipelineConfig, n_series: int) -> TSMixerx:
     loss_key = config.loss.lower()
     valid_loss_cls: Optional[Any] = None
@@ -1601,125 +1484,20 @@ def _create_model(config: PipelineConfig, n_series: int) -> TSMixerx:
         base_kwargs["optimizer_kwargs"] = optimizer_kwargs
 
     # ============================================================
-    # PHASE 2: Ensemble and Multi-Scale Architectures
+    # PHASE 2: Single TSMixerx Model
     # ============================================================
     
-    if config.model_type == "ensemble":
-        logger.info("Creating ensemble of %d models (mode=%s)", config.ensemble_n_models, config.ensemble_mode)
-        logger.info("Ensemble composition: TSMixerx + TFT + xLSTM")
-        
-        models = []
-        
-        # Model 1: TSMixerx (balanced configuration)
-        logger.info("  Ensemble model 1/3: TSMixerx (dropout=0.12, ff_dim=96)")
-        model_1 = _create_single_tsmixer(
-            config, n_series, model_loss, valid_loss_instance,
-            optimizer_cls, optimizer_kwargs, scheduler_cls, scheduler_kwargs,
-            model_cls,
-            dropout=0.12,
-            ff_dim=96,
-            n_block=2,
-            alias="tsmixerx",
+    # Single model mode (default)
+    logger.info("Creating single TSMixerx model")
+    trainer_kwargs = dict(config.trainer_kwargs) if config.trainer_kwargs else {}
+    conflicts = set(base_kwargs).intersection(trainer_kwargs)
+    if conflicts:
+        raise ValueError(
+            "trainer_kwargs override protected arguments: " + ", ".join(sorted(conflicts))
         )
-        models.append(model_1)
-        
-        # Model 2: TFT (Temporal Fusion Transformer)
-        logger.info("  Ensemble model 2/3: TFT (hidden_size=128, n_head=4)")
-        try:
-            model_2 = _create_tft_model(
-                config, n_series, model_loss, valid_loss_instance,
-                optimizer_cls, optimizer_kwargs, scheduler_cls, scheduler_kwargs,
-                hidden_size=128,
-                dropout=0.1,
-                n_head=4,
-                alias="tft",
-            )
-            models.append(model_2)
-            logger.info("  TFT model created successfully")
-        except Exception as e:
-            logger.error("Failed to create TFT model: %s. Using TSMixerx fallback.", e)
-            model_2_fallback = _create_single_tsmixer(
-                config, n_series, model_loss, valid_loss_instance,
-                optimizer_cls, optimizer_kwargs, scheduler_cls, scheduler_kwargs,
-                model_cls,
-                dropout=0.1,
-                ff_dim=96,
-                n_block=2,
-                alias="tsmixerx_fallback_tft",
-            )
-            models.append(model_2_fallback)
-        
-        # Model 3: xLSTM
-        logger.info("  Ensemble model 3/3: xLSTM (hidden_size=128, num_layers=2)")
-        try:
-            model_3 = _create_xlstm_model(
-                config, n_series, model_loss, valid_loss_instance,
-                optimizer_cls, optimizer_kwargs, scheduler_cls, scheduler_kwargs,
-                hidden_size=128,
-                num_layers=2,
-                dropout=0.1,
-                alias="xlstm",
-            )
-            models.append(model_3)
-            logger.info("  xLSTM model created successfully")
-        except Exception as e:
-            logger.error("Failed to create xLSTM model: %s. Using TSMixerx fallback.", e)
-            model_3_fallback = _create_single_tsmixer(
-                config, n_series, model_loss, valid_loss_instance,
-                optimizer_cls, optimizer_kwargs, scheduler_cls, scheduler_kwargs,
-                model_cls,
-                dropout=0.15,
-                ff_dim=80,
-                n_block=2,
-                alias="tsmixerx_fallback_xlstm",
-            )
-            models.append(model_3_fallback)
-        
-        # Create ensemble wrapper
-        ensemble_weights = config.ensemble_weights
-        if ensemble_weights is None:
-            # Auto-calculate balanced weights
-            ensemble_weights = [1.0 / len(models)] * len(models)
-            logger.info("Using balanced weights: %s", ensemble_weights)
-        else:
-            logger.info("Using custom weights: %s", ensemble_weights)
-        
-        # Note: EnsembleForecaster works at PyTorch level, but neuralforecast expects single model
-        # For now, we'll train models separately and average predictions
-        # Return first model as primary, others will be trained in ensemble mode later
-        logger.info("Ensemble created with %d models. Using weighted average for predictions.", len(models))
-        logger.info("Primary model: %s", models[0].alias)
-        
-        # For now, return the first (TSMixerx) model
-        # TODO: Implement full ensemble training loop
-        return models[0]
-        
-    elif config.model_type == "multiscale":
-        logger.info("Creating MultiScaleTSMixer model (scales=%s)", config.multiscale_scales)
-        # MultiScale has different interface - for now use enhanced TSMixerx
-        logger.warning("MultiScaleTSMixer direct integration pending, using enhanced TSMixerx")
-        
-        trainer_kwargs = dict(config.trainer_kwargs) if config.trainer_kwargs else {}
-        conflicts = set(base_kwargs).intersection(trainer_kwargs)
-        if conflicts:
-            raise ValueError(
-                "trainer_kwargs override protected arguments: " + ", ".join(sorted(conflicts))
-            )
-        
-        filtered_kwargs = {key: value for key, value in base_kwargs.items() if value is not None}
-        return model_cls(**filtered_kwargs, **trainer_kwargs)
     
-    else:
-        # Single model mode (default)
-        trainer_kwargs = dict(config.trainer_kwargs) if config.trainer_kwargs else {}
-        conflicts = set(base_kwargs).intersection(trainer_kwargs)
-        if conflicts:
-            raise ValueError(
-                "trainer_kwargs override protected arguments: " + ", ".join(sorted(conflicts))
-            )
-        
-        filtered_kwargs = {key: value for key, value in base_kwargs.items() if value is not None}
-        return model_cls(**filtered_kwargs, **trainer_kwargs)
+    filtered_kwargs = {key: value for key, value in base_kwargs.items() if value is not None}
+    return model_cls(**filtered_kwargs, **trainer_kwargs)
 
 
 def train_and_forecast(frames: Dict[str, pd.DataFrame], config: PipelineConfig) -> pd.DataFrame:
@@ -2221,7 +1999,7 @@ def main() -> None:
     logger.info("Starting WLPR Forecasting Pipeline v5.0 - PHASE 2 COMPLETE")
     logger.info("Timestamp: %s", datetime.now().isoformat())
     logger.info("Phase 1: AdaptivePhysicsLoss + Advanced Features + Reservoir Metrics")
-    logger.info("Phase 2: Ensemble Models (TSMixerx + TFT + xLSTM)")
+    logger.info("Phase 2: Single TSMixerx Model")
     logger.info("Expected improvement: +35-50%% over baseline")
     logger.info("="*80)
     # Validate inputs
