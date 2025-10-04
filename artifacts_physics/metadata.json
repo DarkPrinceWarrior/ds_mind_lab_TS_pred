@@ -167,6 +167,16 @@
     "preprocessing_outlier_contamination": 0.05,
     "preprocessing_smooth_window_length": 7,
     "preprocessing_smooth_polyorder": 2,
+    "model_type": "ensemble",
+    "ensemble_mode": "weighted",
+    "ensemble_weights": null,
+    "ensemble_n_models": 4,
+    "use_multiscale_in_ensemble": true,
+    "multiscale_scales": [
+      1,
+      2,
+      4
+    ],
     "trainer_kwargs": {
       "accelerator": "gpu",
       "devices": 1,
@@ -267,19 +277,19 @@
   "walk_forward_cv": {
     "folds": 6,
     "aggregate": {
-      "mae": 10.58779901706757,
-      "rmse": 17.49306071310349,
-      "mape": 8.577859874700481,
-      "smape": 8.530445738846543,
-      "wmape": 6.920527269901511,
-      "mase": 2.34152185755202,
-      "r2": 0.9782043746320548,
-      "nse": 0.9782043746320548,
-      "kge": 0.9140768892603812,
-      "pbias": 1.8027175468562653,
-      "index_of_agreement": 0.9947654756805774,
-      "mean_bias_error": -2.7478556988374083,
-      "correlation": 0.9955173698456564
+      "mae": 8.889268169790205,
+      "rmse": 15.241735882815743,
+      "mape": 7.394856234462488,
+      "smape": 7.591398609693495,
+      "wmape": 5.811960848580045,
+      "mase": 1.9439073003564078,
+      "r2": 0.985259731850068,
+      "nse": 0.985259731850068,
+      "kge": 0.9304799548663474,
+      "pbias": 2.8020454320304236,
+      "index_of_agreement": 0.9962726201840449,
+      "mean_bias_error": -4.27989378508261,
+      "correlation": 0.9960747407090997
     },
     "details_path": "artifacts_physics\\cv_metrics.json"
   }
