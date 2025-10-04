@@ -170,8 +170,8 @@
     "model_type": "ensemble",
     "ensemble_mode": "weighted",
     "ensemble_weights": null,
-    "ensemble_n_models": 4,
-    "use_multiscale_in_ensemble": true,
+    "ensemble_n_models": 3,
+    "use_multiscale_in_ensemble": false,
     "multiscale_scales": [
       1,
       3,
@@ -295,19 +295,19 @@
   "walk_forward_cv": {
     "folds": 6,
     "aggregate": {
-      "mae": 8.400078680997934,
-      "rmse": 14.691416268190522,
-      "mape": 7.210678673141057,
-      "smape": 7.28788070920421,
-      "wmape": 5.495639444402381,
-      "mase": 1.8321254173725787,
-      "r2": 0.9868679688173806,
-      "nse": 0.9868679688173806,
-      "kge": 0.9425297882152927,
-      "pbias": 1.6782043251567322,
-      "index_of_agreement": 0.9966742230931951,
-      "mean_bias_error": -2.5675966346154153,
-      "correlation": 0.9955241418759646
+      "mae": 8.151358038972598,
+      "rmse": 13.8278394125036,
+      "mape": 6.682140678277828,
+      "smape": 6.886399325263784,
+      "wmape": 5.33101003820655,
+      "mase": 1.7806315329585722,
+      "r2": 0.9878893408679289,
+      "nse": 0.9878893408679289,
+      "kge": 0.9454656220588785,
+      "pbias": 2.6786911036319925,
+      "index_of_agreement": 0.9969003032069244,
+      "mean_bias_error": -4.091810615785335,
+      "correlation": 0.9962356608648386
     },
     "details_path": "artifacts_physics\\cv_metrics.json"
   }
