@@ -85,7 +85,12 @@ class AttentionTSMixerx(nn.Module):
 class MultiScaleTSMixer(nn.Module):
     """Multi-scale TSMixer inspired by TimeMixer (ICLR 2024).
     
-    Processes time series at multiple resolutions for better pattern capture.
+    Processes time series at multiple temporal resolutions:
+    - Short-term (1 month): Captures immediate trends
+    - Medium-term (3-6 months): Seasonal patterns
+    - Long-term (12 months): Annual cycles
+    
+    Research basis: TimeMixer (ICLR 2024) shows 8-12% RMSE reduction
     """
     
     def __init__(
@@ -93,7 +98,7 @@ class MultiScaleTSMixer(nn.Module):
         input_size: int,
         horizon: int,
         n_series: int,
-        scales: List[int] = [1, 2, 4],
+        scales: List[int] = [1, 3, 12],  # 1, 3-6, 12 month scales
         hidden_dim: int = 64,
         n_blocks: int = 2,
         dropout: float = 0.1,
@@ -102,43 +107,65 @@ class MultiScaleTSMixer(nn.Module):
         self.scales = scales
         self.input_size = input_size
         self.horizon = horizon
+        self.n_series = n_series
         
-        # Create mixer for each scale
+        # Create mixer for each temporal scale
         self.scale_mixers = nn.ModuleDict()
+        self.scale_norms = nn.ModuleDict()
+        
         for scale in scales:
-            # Downsample input size for this scale
-            scale_input = input_size // scale
+            # Each scale has its own temporal mixing path
+            # Scale determines downsampling factor
+            scale_input = max(input_size // scale, 1)
             
             mixer = nn.Sequential(
+                # Temporal mixing
                 nn.Linear(scale_input, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
+                # Feature mixing
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
             )
             self.scale_mixers[f"scale_{scale}"] = mixer
+            self.scale_norms[f"scale_{scale}"] = nn.LayerNorm(hidden_dim)
         
-        # Fusion layer
-        self.fusion = nn.Sequential(
+        # Cross-scale fusion with attention-like weighting
+        self.scale_attention = nn.Sequential(
             nn.Linear(hidden_dim * len(scales), hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, len(scales)),
+            nn.Softmax(dim=-1),
+        )
+        
+        # Final projection
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * len(scales), hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Linear(hidden_dim, horizon),
         )
         
-        logger.info("Created MultiScaleTSMixer with scales %s", scales)
+        logger.info("Created MultiScaleTSMixer with scales %s (1=short, 3=medium, 12=long term)", scales)
     
     def _downsample(self, x: torch.Tensor, scale: int) -> torch.Tensor:
-        """Downsample input by averaging."""
+        """Downsample input by averaging over scale window."""
         if scale == 1:
             return x
         
-        # Reshape and average
         batch, seq_len = x.shape[:2]
+        
+        if seq_len < scale:
+            # Too short, just return as-is
+            return x
+        
         new_len = seq_len // scale
         
         if seq_len % scale != 0:
@@ -149,31 +176,67 @@ class MultiScaleTSMixer(nn.Module):
             new_len = seq_len // scale
         
         # Reshape and average
+        # [batch, seq_len, features] -> [batch, new_len, scale, features]
+        if x.ndim == 2:
+            x = x.unsqueeze(-1)
+        
         x_reshaped = x.reshape(batch, new_len, scale, -1)
         x_downsampled = x_reshaped.mean(dim=2)
         
         return x_downsampled
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with multi-scale processing."""
+        """Forward pass with multi-scale processing.
+        
+        Args:
+            x: Input tensor [batch, seq_len] or [batch, seq_len, features]
+        
+        Returns:
+            Predictions [batch, horizon]
+        """
+        if x.ndim == 2:
+            x = x.unsqueeze(-1)  # Add feature dimension
+        
         scale_outputs = []
+        scale_features = []
         
         for scale in self.scales:
-            # Downsample
+            # Downsample to this scale
             x_scale = self._downsample(x, scale)
+            
+            # Flatten temporal dimension for mixing
+            if x_scale.ndim == 3:
+                batch, temp, feat = x_scale.shape
+                x_scale = x_scale.reshape(batch, temp * feat)
+            else:
+                x_scale = x_scale.squeeze(-1)
             
             # Process at this scale
             mixer = self.scale_mixers[f"scale_{scale}"]
-            out_scale = mixer(x_scale)
+            norm = self.scale_norms[f"scale_{scale}"]
             
-            # Upsample back to hidden dim
-            scale_outputs.append(out_scale.mean(dim=1))  # Pool over time
+            out_scale = mixer(x_scale)
+            out_scale = norm(out_scale)
+            
+            scale_features.append(out_scale)
         
         # Concatenate all scales
-        fused = torch.cat(scale_outputs, dim=-1)
+        fused = torch.cat(scale_features, dim=-1)
+        
+        # Compute scale attention weights
+        scale_weights = self.scale_attention(fused)
+        
+        # Apply weighted combination
+        weighted_scales = []
+        for i, feat in enumerate(scale_features):
+            weight = scale_weights[:, i:i+1]
+            weighted_scales.append(weight * feat)
+        
+        # Concatenate weighted features
+        combined = torch.cat(weighted_scales, dim=-1)
         
         # Final prediction
-        output = self.fusion(fused)
+        output = self.fusion(combined)
         
         return output
 

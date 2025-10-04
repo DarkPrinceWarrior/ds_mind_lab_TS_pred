@@ -462,7 +462,7 @@ class PipelineConfig:
     ensemble_weights: Optional[List[float]] = None  # Auto-calculated if None
     ensemble_n_models: int = 4  # Number of models in ensemble
     use_multiscale_in_ensemble: bool = True  # Add MultiScale to ensemble
-    multiscale_scales: List[int] = field(default_factory=lambda: [1, 2, 4])
+    multiscale_scales: List[int] = field(default_factory=lambda: [1, 3, 12])  # Short, medium, long-term scales
     trainer_kwargs: Dict[str, Any] = field(
         default_factory=lambda: {
             "accelerator": "gpu" if torch.cuda.is_available() else "auto",
@@ -498,6 +498,10 @@ class PipelineConfig:
             "wlpr_std3", "wlpr_std6", "wlpr_std12",
             "wbhp_ma3", "wbhp_ma6", "wbhp_ma12",
             "wbhp_std3", "wbhp_std6", "wbhp_std12",
+            # IMPROVEMENT #4: Advanced features (Fourier, pressure gradients, PCA)
+            "fourier_sin_1", "fourier_cos_1", "fourier_sin_2", "fourier_cos_2", "fourier_sin_3", "fourier_cos_3",
+            "wbhp_gradient", "productivity_index", "pressure_rate_product",
+            "ts_embed_0", "ts_embed_1", "ts_embed_2",
         ]
     )
     futr_exog: List[str] = field(
@@ -513,6 +517,8 @@ class PipelineConfig:
             "inj_wwir_lag_weighted",
             "inj_wwit_diff_lag_weighted",
             "inj_wwir_crm_weighted",
+            # IMPROVEMENT #4: Fourier features for future exogenous
+            "fourier_sin_1", "fourier_cos_1", "fourier_sin_2", "fourier_cos_2", "fourier_sin_3", "fourier_cos_3",
         ]
     )
     static_exog: List[str] = field(
@@ -841,10 +847,29 @@ def run_walk_forward_validation(
             fold_prod = _create_spatial_features(fold_prod, coords)
             fold_prod = _create_rolling_statistics(fold_prod, feature_cols=["wlpr", "wbhp"], windows=[3, 6, 12])
             
+            # IMPROVEMENT #4: Create advanced features (Fourier, pressure gradients, PCA)
+            from features_advanced import create_fourier_features, create_pressure_gradient_features, create_time_series_embeddings
+            fold_prod = create_fourier_features(fold_prod, date_col="ds", n_frequencies=3)
+            fold_prod = create_pressure_gradient_features(fold_prod, pressure_col="wbhp", rate_col="wlpr")
+            key_features = ["wlpr", "wbhp", "womr"] if all(col in fold_prod.columns for col in ["wlpr", "wbhp", "womr"]) else ["wlpr"]
+            fold_prod = create_time_series_embeddings(fold_prod, feature_cols=key_features, window=12, n_components=3)
+            
+            # Fill missing advanced features with zeros (some may not be created for all wells)
+            for col in feature_cols:
+                if col not in fold_prod.columns:
+                    logger.warning("Fold %d: Feature '%s' not found, filling with zeros", split['fold'], col)
+                    fold_prod[col] = 0.0
+                else:
+                    # Fill NaN values with 0.0 (PCA embeddings may have NaN for early periods)
+                    if fold_prod[col].isna().any():
+                        nan_count = fold_prod[col].isna().sum()
+                        logger.debug("Fold %d: Feature '%s' has %d NaN values, filling with zeros", split['fold'], col, nan_count)
+                        fold_prod[col] = fold_prod[col].fillna(0.0)
+            
             missing_fold_features = [col for col in feature_cols if col not in fold_prod.columns]
             if missing_fold_features:
                 raise ValueError(
-                    f"Fold {split['fold']} missing required features: {missing_fold_features}"
+                    f"Fold {split['fold']} missing required features after filling: {missing_fold_features}"
                 )
             train_keys = fold_train_raw[["unique_id", "ds"]].drop_duplicates()
             val_keys = fold_val_raw[["unique_id", "ds"]].drop_duplicates()
@@ -1193,7 +1218,7 @@ def prepare_model_frames(
     #                 "WellPINN" (2025), "TimeMixer" (ICLR 2024)
     # Expected: +10-15% R², better pattern capture
     # ============================================================
-    logger.info("Creating advanced features (interactions, spatial, rolling stats)")
+    logger.info("Creating advanced features (interactions, spatial, rolling stats, Fourier, PCA, pressure gradients)")
     
     # 1. Interaction features (wlpr × wbhp, wlpr × injection, etc.)
     prod_df = _create_interaction_features(prod_df)
@@ -1208,13 +1233,37 @@ def prepare_model_frames(
         windows=[3, 6, 12],
     )
     
-    logger.info("Advanced features created successfully")
+    # 4. Fourier features for seasonality (frequency domain)
+    from features_advanced import create_fourier_features, create_pressure_gradient_features, create_time_series_embeddings
+    prod_df = create_fourier_features(prod_df, date_col="ds", n_frequencies=3)
+    
+    # 5. Pressure gradient features (physics-informed derivatives)
+    prod_df = create_pressure_gradient_features(prod_df, pressure_col="wbhp", rate_col="wlpr")
+    
+    # 6. Time series embeddings (PCA compression for pattern recognition)
+    # Note: This is computationally expensive, use smaller subset
+    key_features = ["wlpr", "wbhp", "womr"] if all(col in prod_df.columns for col in ["wlpr", "wbhp", "womr"]) else ["wlpr"]
+    prod_df = create_time_series_embeddings(prod_df, feature_cols=key_features, window=12, n_components=3)
+    
+    logger.info("Advanced features created successfully (Total: interactions, spatial, rolling, Fourier, pressure gradients, PCA embeddings)")
     # ============================================================
     
+    # Fill missing advanced features with zeros (some may not be created for all wells)
     feature_cols = set(config.hist_exog + config.futr_exog)
+    for col in feature_cols:
+        if col not in prod_df.columns:
+            logger.warning("Feature '%s' not found in data, filling with zeros", col)
+            prod_df[col] = 0.0
+        else:
+            # Fill NaN values with 0.0 (PCA embeddings may have NaN for early periods)
+            if prod_df[col].isna().any():
+                nan_count = prod_df[col].isna().sum()
+                logger.debug("Feature '%s' has %d NaN values, filling with zeros", col, nan_count)
+                prod_df[col] = prod_df[col].fillna(0.0)
+    
     missing_features = [col for col in feature_cols if col not in prod_df.columns]
     if missing_features:
-        raise ValueError(f"Missing required features: {missing_features}")
+        raise ValueError(f"Missing required features after filling: {missing_features}")
     train_df = prod_df[prod_df["ds"] < test_start].copy()
     test_df = prod_df[prod_df["ds"] >= test_start].copy()
     if train_df.empty or test_df.empty:

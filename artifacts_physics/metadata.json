@@ -174,8 +174,8 @@
     "use_multiscale_in_ensemble": true,
     "multiscale_scales": [
       1,
-      2,
-      4
+      3,
+      12
     ],
     "trainer_kwargs": {
       "accelerator": "gpu",
@@ -214,7 +214,19 @@
       "wbhp_ma12",
       "wbhp_std3",
       "wbhp_std6",
-      "wbhp_std12"
+      "wbhp_std12",
+      "fourier_sin_1",
+      "fourier_cos_1",
+      "fourier_sin_2",
+      "fourier_cos_2",
+      "fourier_sin_3",
+      "fourier_cos_3",
+      "wbhp_gradient",
+      "productivity_index",
+      "pressure_rate_product",
+      "ts_embed_0",
+      "ts_embed_1",
+      "ts_embed_2"
     ],
     "futr_exog": [
       "month_sin",
@@ -227,7 +239,13 @@
       "wwit_diff",
       "inj_wwir_lag_weighted",
       "inj_wwit_diff_lag_weighted",
-      "inj_wwir_crm_weighted"
+      "inj_wwir_crm_weighted",
+      "fourier_sin_1",
+      "fourier_cos_1",
+      "fourier_sin_2",
+      "fourier_cos_2",
+      "fourier_sin_3",
+      "fourier_cos_3"
     ],
     "static_exog": [
       "x",
@@ -277,19 +295,19 @@
   "walk_forward_cv": {
     "folds": 6,
     "aggregate": {
-      "mae": 8.889268169790205,
-      "rmse": 15.241735882815743,
-      "mape": 7.394856234462488,
-      "smape": 7.591398609693495,
-      "wmape": 5.811960848580045,
-      "mase": 1.9439073003564078,
-      "r2": 0.985259731850068,
-      "nse": 0.985259731850068,
-      "kge": 0.9304799548663474,
-      "pbias": 2.8020454320304236,
-      "index_of_agreement": 0.9962726201840449,
-      "mean_bias_error": -4.27989378508261,
-      "correlation": 0.9960747407090997
+      "mae": 8.400078680997934,
+      "rmse": 14.691416268190522,
+      "mape": 7.210678673141057,
+      "smape": 7.28788070920421,
+      "wmape": 5.495639444402381,
+      "mase": 1.8321254173725787,
+      "r2": 0.9868679688173806,
+      "nse": 0.9868679688173806,
+      "kge": 0.9425297882152927,
+      "pbias": 1.6782043251567322,
+      "index_of_agreement": 0.9966742230931951,
+      "mean_bias_error": -2.5675966346154153,
+      "correlation": 0.9955241418759646
     },
     "details_path": "artifacts_physics\\cv_metrics.json"
   }
