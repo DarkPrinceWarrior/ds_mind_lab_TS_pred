@@ -162,6 +162,11 @@
       "num_workers": 0,
       "pin_memory": false
     },
+    "enable_physics_preprocessing": true,
+    "preprocessing_structural_break_threshold": 0.7,
+    "preprocessing_outlier_contamination": 0.05,
+    "preprocessing_smooth_window_length": 7,
+    "preprocessing_smooth_polyorder": 2,
     "trainer_kwargs": {
       "accelerator": "gpu",
       "devices": 1,

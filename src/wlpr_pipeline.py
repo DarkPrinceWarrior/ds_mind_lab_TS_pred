@@ -10,18 +10,30 @@ try:
     from .features_injection import build_injection_lag_features
     from .data_validation import validate_and_report, WellDataValidator
     from .metrics_extended import calculate_all_metrics, print_metrics_summary, calculate_metrics_by_horizon
+    from .metrics_reservoir import compute_all_reservoir_metrics
     from .logging_config import setup_logging, log_execution_time
     from .mlflow_tracking import create_tracker
     from .caching import CacheManager, cached
     from .physics_loss_advanced import AdaptivePhysicsLoss
+    from .data_preprocessing_advanced import (
+        PhysicsAwarePreprocessor,
+        create_decline_features,
+        add_production_stage_features,
+    )
 except ImportError:  # pragma: no cover
     from features_injection import build_injection_lag_features
     from data_validation import validate_and_report, WellDataValidator
     from metrics_extended import calculate_all_metrics, print_metrics_summary, calculate_metrics_by_horizon
+    from metrics_reservoir import compute_all_reservoir_metrics
     from logging_config import setup_logging, log_execution_time
     from mlflow_tracking import create_tracker
     from caching import CacheManager, cached
     from physics_loss_advanced import AdaptivePhysicsLoss
+    from data_preprocessing_advanced import (
+        PhysicsAwarePreprocessor,
+        create_decline_features,
+        add_production_stage_features,
+    )
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -436,6 +448,12 @@ class PipelineConfig:
     lr_scheduler_name: Optional[str] = "onecycle"
     lr_scheduler_kwargs: Dict[str, Any] = field(default_factory=lambda: {"pct_start": 0.3, "div_factor": 10.0})
     dataloader_kwargs: Dict[str, Any] = field(default_factory=lambda: {"num_workers": 0, "pin_memory": False})
+    # IMPROVEMENT #4: Physics-Aware Preprocessing parameters
+    enable_physics_preprocessing: bool = True
+    preprocessing_structural_break_threshold: float = 0.7
+    preprocessing_outlier_contamination: float = 0.05
+    preprocessing_smooth_window_length: int = 7
+    preprocessing_smooth_polyorder: int = 2
     trainer_kwargs: Dict[str, Any] = field(
         default_factory=lambda: {
             "accelerator": "gpu" if torch.cuda.is_available() else "auto",
@@ -528,6 +546,52 @@ def load_raw_data(path: Path, validate: bool = True) -> pd.DataFrame:
     df = df.sort_values(["well", "date"])
     df = df.drop_duplicates(["well", "date"])
     logger.info("Loaded %d rows for %d wells", len(df), df["well"].nunique())
+    
+    # ============================================================
+    # IMPROVEMENT #4: Physics-Aware Preprocessing
+    # Advanced data preprocessing with physics constraints
+    # ============================================================
+    try:
+        logger.info("Applying physics-aware preprocessing")
+        
+        # Detect structural breaks (shutdowns, workovers)
+        preprocessor = PhysicsAwarePreprocessor(well_type="PROD")
+        df = preprocessor.detect_structural_breaks(df, rate_col="wlpr", threshold=0.7)
+        
+        # Physics-aware imputation (cubic spline for rates)
+        rate_cols = [col for col in ["wlpr", "womr", "wwir"] if col in df.columns]
+        cumulative_cols = [col for col in ["wlpt", "womt", "wwit"] if col in df.columns]
+        
+        if rate_cols or cumulative_cols:
+            df = preprocessor.physics_aware_imputation(
+                df,
+                rate_cols=rate_cols,
+                cumulative_cols=cumulative_cols,
+            )
+        
+        # Multivariate outlier detection
+        feature_cols = [col for col in ["wlpr", "wbhp", "wwir"] if col in df.columns]
+        if len(feature_cols) >= 2:  # Need at least 2 features
+            df = preprocessor.detect_outliers_multivariate(
+                df,
+                feature_cols=feature_cols,
+                contamination=0.05,
+            )
+        
+        # Smooth rates with Savitzky-Golay filter
+        rate_cols_smooth = [col for col in ["wlpr", "womr"] if col in df.columns]
+        if rate_cols_smooth:
+            df = preprocessor.smooth_rates_savgol(
+                df,
+                rate_cols=rate_cols_smooth,
+                window_length=7,
+                polyorder=2,
+            )
+        
+        logger.info("Physics-aware preprocessing completed")
+    except Exception as exc:
+        logger.warning("Physics-aware preprocessing failed: %s", exc)
+    # ============================================================
     
     # Validate if requested
     if validate:
@@ -1446,7 +1510,35 @@ def evaluate_predictions(
                 insample=insample,
                 seasonal_period=seasonal_period,
             )
-    metrics = {"overall": overall, "by_well": per_well, "observations": int(len(merged))}
+    # ============================================================
+    # IMPROVEMENT #3: Reservoir-Specific Metrics
+    # Add petroleum engineering metrics for better interpretability
+    # ============================================================
+    reservoir_metrics = {}
+    try:
+        # Compute reservoir-specific metrics
+        time_idx = merged.groupby("unique_id").cumcount().to_numpy()
+        
+        reservoir_metrics = compute_all_reservoir_metrics(
+            y_true=merged["y"].to_numpy(),
+            y_pred=merged["y_hat"].to_numpy(),
+            time_idx=time_idx,
+            # Optional: add pressure, injection, water cut if available
+            # pressure_true=merged["wbhp"].to_numpy() if "wbhp" in merged.columns else None,
+            # injection_rates=... if available
+        )
+        
+        logger.info("Computed %d reservoir-specific metrics", len([k for k, v in reservoir_metrics.items() if v is not None]))
+    except Exception as exc:
+        logger.warning("Could not compute reservoir metrics: %s", exc)
+    # ============================================================
+    
+    metrics = {
+        "overall": overall, 
+        "by_well": per_well, 
+        "observations": int(len(merged)),
+        "reservoir": reservoir_metrics,  # NEW: Reservoir metrics
+    }
     return metrics, merged
 
 

@@ -225,5 +225,18 @@
       "correlation": 0.6775529751966427
     }
   },
-  "observations": 78
+  "observations": 78,
+  "reservoir": {
+    "decline_peak_production_error_pct": 3.8209710562774366,
+    "decline_peak_time_error_months": null,
+    "decline_decline_rate_true": -0.029041320256350086,
+    "decline_decline_rate_pred": -0.027966172054034854,
+    "decline_decline_rate_error_pct": -3.7021327882001893,
+    "decline_cumulative_error_pct": 2.2344003644484105,
+    "decline_plateau_duration_true": null,
+    "decline_plateau_duration_pred": null,
+    "decline_plateau_duration_error": null,
+    "reliability_direction_accuracy": 0.8717948717948718,
+    "reliability_forecast_skill_vs_persistence": 0.9809686027544754
+  }
 }
