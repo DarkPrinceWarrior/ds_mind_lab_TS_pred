@@ -255,29 +255,7 @@ def create_fourier_features(
     return df
 
 
-def create_well_vintage_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Create features based on well age/maturity.
-    
-    Args:
-        df: Well data
-    
-    Returns:
-        DataFrame with vintage features
-    """
-    df = df.copy()
-    
-    for well in df["well"].unique():
-        well_mask = df["well"] == well
-        
-        # Time since first production
-        df.loc[well_mask, "well_age_months"] = df.loc[well_mask, "time_idx"] if "time_idx" in df.columns else np.arange(well_mask.sum())
-        
-        # Well age buckets
-        age = df.loc[well_mask, "well_age_months"].values if "well_age_months" in df.columns else np.arange(well_mask.sum())
-        df.loc[well_mask, "is_new_well"] = (age < 12).astype(int)
-        df.loc[well_mask, "is_mature_well"] = (age >= 36).astype(int)
-    
-    return df
+
 
 
 def create_rolling_statistics(
@@ -334,66 +312,4 @@ def create_rolling_statistics(
     return df
 
 
-def create_cumulative_injection_features(
-    prod_df: pd.DataFrame,
-    inj_df: pd.DataFrame,
-    injection_summary: pd.DataFrame,
-) -> pd.DataFrame:
-    """Create cumulative injection features by well pair.
-    
-    Research basis: CRM models emphasize cumulative injection importance
-    
-    Args:
-        prod_df: Producer data
-        inj_df: Injector data
-        injection_summary: Pair summary from build_injection_lag_features
-    
-    Returns:
-        DataFrame with cumulative injection features
-    """
-    prod_df = prod_df.copy()
-    
-    if injection_summary.empty:
-        return prod_df
-    
-    # Group by producer
-    for prod_id in prod_df["well"].unique():
-        prod_mask = prod_df["well"] == prod_id
-        
-        # Get influencing injectors
-        pairs = injection_summary[injection_summary["prod_id"] == str(prod_id)]
-        
-        if pairs.empty:
-            continue
-        
-        # Sum weighted cumulative injection
-        total_weighted_cum_inj = np.zeros(prod_mask.sum())
-        
-        for _, pair in pairs.iterrows():
-            inj_id = pair["inj_id"]
-            weight = pair["weight"]
-            lag = pair["lag"]
-            
-            inj_mask = inj_df["well"] == inj_id
-            if inj_mask.sum() == 0:
-                continue
-            
-            # Get cumulative injection
-            if "wwit" in inj_df.columns:
-                cum_inj = inj_df.loc[inj_mask, "wwit"].values
-            else:
-                cum_inj = inj_df.loc[inj_mask, "wwir"].cumsum().values
-            
-            # Shift by lag
-            if lag > 0 and lag < len(cum_inj):
-                cum_inj_lagged = np.concatenate([np.zeros(lag), cum_inj[:-lag]])
-            else:
-                cum_inj_lagged = cum_inj
-            
-            # Align lengths
-            min_len = min(len(cum_inj_lagged), len(total_weighted_cum_inj))
-            total_weighted_cum_inj[:min_len] += weight * cum_inj_lagged[:min_len]
-        
-        prod_df.loc[prod_mask, "cumulative_weighted_injection"] = total_weighted_cum_inj
-    
-    return prod_df
+

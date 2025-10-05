@@ -15,12 +15,7 @@ try:
     from .mlflow_tracking import create_tracker
     from .caching import CacheManager, cached
     from .physics_loss_advanced import AdaptivePhysicsLoss
-    from .data_preprocessing_advanced import (
-        PhysicsAwarePreprocessor,
-        create_decline_features,
-        add_production_stage_features,
-    )
-    from .models_advanced import EnsembleForecaster, MultiScaleTSMixer
+    from .data_preprocessing_advanced import PhysicsAwarePreprocessor
 except ImportError:  # pragma: no cover
     from features_injection import build_injection_lag_features
     from data_validation import validate_and_report, WellDataValidator
@@ -30,12 +25,7 @@ except ImportError:  # pragma: no cover
     from mlflow_tracking import create_tracker
     from caching import CacheManager, cached
     from physics_loss_advanced import AdaptivePhysicsLoss
-    from data_preprocessing_advanced import (
-        PhysicsAwarePreprocessor,
-        create_decline_features,
-        add_production_stage_features,
-    )
-    from models_advanced import EnsembleForecaster, MultiScaleTSMixer
+    from data_preprocessing_advanced import PhysicsAwarePreprocessor
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
