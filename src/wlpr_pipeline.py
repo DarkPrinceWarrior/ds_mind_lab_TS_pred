@@ -525,6 +525,13 @@ class PipelineConfig:
             "quadrant_0", "quadrant_1", "quadrant_2", "quadrant_3",
         ]
     )
+    # Chronos-2 configuration (zero-shot)
+    chronos_hub_model_name: str = "amazon/chronos-2"
+    chronos_hub_model_revision: Optional[str] = None
+    chronos_local_dir: Optional[str] = None
+    chronos_input_chunk_length: Optional[int] = None
+    chronos_output_chunk_length: Optional[int] = None
+    chronos_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 
 
@@ -895,20 +902,30 @@ def run_walk_forward_validation(
             fold_val = fold_val_raw
             fold_static_df = static_df
             
-        model = _create_model(config, n_series=fold_train["unique_id"].nunique())
-        nf = NeuralForecast(models=[model], freq=config.freq)
-        nf.fit(
-            df=fold_train,
-            static_df=fold_static_df,
-            val_size=config.val_horizon,
-        )
-        fold_futr = fold_val[futr_columns].copy()
-        preds = nf.predict(futr_df=fold_futr, static_df=fold_static_df)
-        
-        # Auto-detect prediction column (model alias may vary)
-        pred_cols = [col for col in preds.columns if col not in ['ds', 'unique_id']]
-        if pred_cols:
-            preds = preds.rename(columns={pred_cols[0]: "y_hat"})
+        if config.model_type == "chronos2":
+            future_df = pd.concat(
+                [
+                    fold_train[["unique_id", "ds"] + config.futr_exog],
+                    fold_val[["unique_id", "ds"] + config.futr_exog],
+                ],
+                ignore_index=True,
+            ).sort_values(["unique_id", "ds"])
+            preds = _chronos2_predict(fold_train, future_df, config)
+        else:
+            model = _create_model(config, n_series=fold_train["unique_id"].nunique())
+            nf = NeuralForecast(models=[model], freq=config.freq)
+            nf.fit(
+                df=fold_train,
+                static_df=fold_static_df,
+                val_size=config.val_horizon,
+            )
+            fold_futr = fold_val[futr_columns].copy()
+            preds = nf.predict(futr_df=fold_futr, static_df=fold_static_df)
+            
+            # Auto-detect prediction column (model alias may vary)
+            pred_cols = [col for col in preds.columns if col not in ['ds', 'unique_id']]
+            if pred_cols:
+                preds = preds.rename(columns={pred_cols[0]: "y_hat"})
         
         metrics, merged = evaluate_predictions(
             preds,
@@ -1515,7 +1532,118 @@ def _create_model(config: PipelineConfig, n_series: int) -> TSMixerx:
     return model_cls(**filtered_kwargs, **trainer_kwargs)
 
 
+def _import_chronos2():
+    try:
+        from darts import TimeSeries
+        from darts.models import Chronos2Model
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "Chronos2Model requires 'darts' and its dependencies. "
+            "Install with: pip install darts transformers accelerate"
+        ) from exc
+    return TimeSeries, Chronos2Model
+
+
+def _build_chronos2_model(config: PipelineConfig):
+    _, Chronos2Model = _import_chronos2()
+    input_len = config.chronos_input_chunk_length or config.input_size
+    output_len = config.chronos_output_chunk_length or config.horizon
+    return Chronos2Model(
+        input_chunk_length=input_len,
+        output_chunk_length=output_len,
+        hub_model_name=config.chronos_hub_model_name,
+        hub_model_revision=config.chronos_hub_model_revision,
+        local_dir=config.chronos_local_dir,
+        **(config.chronos_kwargs or {}),
+    )
+
+
+def _chronos2_predict(
+    train_df: pd.DataFrame,
+    future_df: pd.DataFrame,
+    config: PipelineConfig,
+) -> pd.DataFrame:
+    TimeSeries, _ = _import_chronos2()
+    series_ids = sorted(train_df["unique_id"].unique())
+    if not series_ids:
+        raise ValueError("No series available for Chronos2 forecasting.")
+
+    train_series = []
+    past_covs = []
+    future_covs = []
+
+    use_past_cov = bool(config.hist_exog)
+    use_future_cov = bool(config.futr_exog)
+
+    for uid in series_ids:
+        train_slice = train_df[train_df["unique_id"] == uid].sort_values("ds")
+        future_slice = future_df[future_df["unique_id"] == uid].sort_values("ds")
+        if train_slice.empty:
+            continue
+
+        train_series.append(
+            TimeSeries.from_dataframe(train_slice, time_col="ds", value_cols="y")
+        )
+
+        if use_past_cov:
+            past_cols = [col for col in config.hist_exog if col in train_slice.columns]
+            past_covs.append(
+                TimeSeries.from_dataframe(train_slice, time_col="ds", value_cols=past_cols)
+            )
+
+        if use_future_cov:
+            future_cols = [col for col in config.futr_exog if col in future_slice.columns]
+            future_covs.append(
+                TimeSeries.from_dataframe(future_slice, time_col="ds", value_cols=future_cols)
+            )
+
+    model = _build_chronos2_model(config)
+    fit_kwargs = {"series": train_series, "verbose": False}
+    predict_kwargs = {"n": config.horizon, "series": train_series}
+
+    if use_past_cov:
+        fit_kwargs["past_covariates"] = past_covs
+        predict_kwargs["past_covariates"] = past_covs
+    if use_future_cov:
+        fit_kwargs["future_covariates"] = future_covs
+        predict_kwargs["future_covariates"] = future_covs
+
+    model.fit(**fit_kwargs)
+    preds = model.predict(**predict_kwargs)
+
+    if not isinstance(preds, list):
+        preds = [preds]
+
+    pred_frames = []
+    for uid, pred in zip(series_ids, preds):
+        pred_df = pred.to_dataframe().reset_index()
+        time_col = pred_df.columns[0]
+        value_cols = [col for col in pred_df.columns if col != time_col]
+        if not value_cols:
+            raise ValueError("Chronos2 prediction returned no value columns.")
+        pred_df = pred_df.rename(columns={time_col: "ds", value_cols[0]: "y_hat"})
+        pred_df["unique_id"] = uid
+        pred_frames.append(pred_df[["unique_id", "ds", "y_hat"]])
+
+    pred_df = pd.concat(pred_frames, ignore_index=True)
+    return pred_df
+
+
 def train_and_forecast(frames: Dict[str, pd.DataFrame], config: PipelineConfig) -> pd.DataFrame:
+    if config.model_type == "chronos2":
+        train_df = frames["train_df"]
+        test_df = frames["test_df"]
+        future_df = pd.concat(
+            [
+                train_df[["unique_id", "ds"] + config.futr_exog],
+                test_df[["unique_id", "ds"] + config.futr_exog],
+            ],
+            ignore_index=True,
+        ).sort_values(["unique_id", "ds"])
+        preds = _chronos2_predict(train_df, future_df, config)
+        logger.info("Generated %d Chronos2 forecast rows", len(preds))
+        return preds
+
     model = _create_model(config, len(frames["target_wells"]))
     nf = NeuralForecast(models=[model], freq=config.freq)
     nf.fit(
@@ -1985,6 +2113,43 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level",
     )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default="single",
+        choices=["single", "chronos2"],
+        help="Model backend to use (single=TSMixerx, chronos2=Chronos-2)",
+    )
+    parser.add_argument(
+        "--chronos-model",
+        type=str,
+        default=None,
+        help="Chronos-2 hub model name (e.g., amazon/chronos-2 or autogluon/chronos-2-small)",
+    )
+    parser.add_argument(
+        "--chronos-revision",
+        type=str,
+        default=None,
+        help="Chronos-2 hub model revision (branch, tag, commit)",
+    )
+    parser.add_argument(
+        "--chronos-local-dir",
+        type=Path,
+        default=None,
+        help="Local directory for Chronos-2 model cache",
+    )
+    parser.add_argument(
+        "--chronos-input-len",
+        type=int,
+        default=None,
+        help="Chronos-2 input chunk length (defaults to input_size)",
+    )
+    parser.add_argument(
+        "--chronos-output-len",
+        type=int,
+        default=None,
+        help="Chronos-2 output chunk length (defaults to horizon)",
+    )
     return parser.parse_args()
 
 
@@ -2024,7 +2189,17 @@ def main() -> None:
         raise FileNotFoundError(f"Coordinate file not found at {args.coords_path}")
     
     # Initialize configuration
-    config = PipelineConfig(loss="physics")
+    config = PipelineConfig(loss="physics", model_type=args.model_type)
+    if args.chronos_model:
+        config.chronos_hub_model_name = args.chronos_model
+    if args.chronos_revision:
+        config.chronos_hub_model_revision = args.chronos_revision
+    if args.chronos_local_dir:
+        config.chronos_local_dir = str(args.chronos_local_dir)
+    if args.chronos_input_len:
+        config.chronos_input_chunk_length = int(args.chronos_input_len)
+    if args.chronos_output_len:
+        config.chronos_output_chunk_length = int(args.chronos_output_len)
     
     # Initialize cache
     if not args.disable_cache:
