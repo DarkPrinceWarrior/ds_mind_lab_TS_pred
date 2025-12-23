@@ -172,6 +172,8 @@ def create_time_series_embeddings(
     feature_cols: List[str],
     window: int = 12,
     n_components: int = 3,
+    train_cutoff: Optional[pd.Timestamp] = None,
+    date_col: str = "ds",
 ) -> pd.DataFrame:
     """Create compressed time series representations using PCA.
     
@@ -182,12 +184,18 @@ def create_time_series_embeddings(
         feature_cols: Features to embed
         window: Lookback window
         n_components: Number of PCA components
+        train_cutoff: Optional cutoff date to fit PCA only on training windows
+        date_col: Date column name
     
     Returns:
         DataFrame with embedding features
     """
     df = df.copy()
     
+    if date_col not in df.columns:
+        logger.warning("No date column '%s' found, skipping time series embeddings", date_col)
+        return df
+
     for well in df["well"].unique():
         well_mask = df["well"] == well
         well_data = df.loc[well_mask, feature_cols].fillna(0.0)
@@ -205,9 +213,25 @@ def create_time_series_embeddings(
         
         X = np.array(windows)
         
-        # Apply PCA
-        pca = PCA(n_components=min(n_components, X.shape[1]))
-        embeddings = pca.fit_transform(X)
+        X_train = X
+        if train_cutoff is not None:
+            well_dates = pd.to_datetime(df.loc[well_mask, date_col]).to_numpy()
+            window_end_dates = well_dates[window:]
+            cutoff = np.datetime64(train_cutoff)
+            train_mask = window_end_dates <= cutoff
+            X_train = X[train_mask]
+            if X_train.shape[0] < max(n_components, 2):
+                logger.warning(
+                    "Well %s: not enough training windows for PCA (have %d), skipping embeddings",
+                    well,
+                    X_train.shape[0],
+                )
+                continue
+
+        # Apply PCA (fit on training windows only, then transform all windows)
+        pca = PCA(n_components=min(n_components, X_train.shape[1]))
+        pca.fit(X_train)
+        embeddings = pca.transform(X)
         
         # Assign back to dataframe
         indices = well_data.index[window:]
@@ -310,6 +334,5 @@ def create_rolling_statistics(
                 ).max()
     
     return df
-
 
 

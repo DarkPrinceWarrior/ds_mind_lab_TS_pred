@@ -59,7 +59,7 @@ class PhysicsAwarePreprocessor:
             relative_drop = -rate_change / rate_prev
             
             shutdown_mask = relative_drop > threshold
-            df.loc[well_mask, "is_shutdown"] = np.insert(shutdown_mask, 0, False)
+            df.loc[well_mask, "is_shutdown"] = shutdown_mask
             
             # Detect startups: rate increases after near-zero
             was_low = rates < (self.min_rate + 1.0)

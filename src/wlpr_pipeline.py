@@ -16,6 +16,11 @@ try:
     from .caching import CacheManager, cached
     from .physics_loss_advanced import AdaptivePhysicsLoss
     from .data_preprocessing_advanced import PhysicsAwarePreprocessor
+    from .features_advanced import (
+        create_fourier_features,
+        create_pressure_gradient_features,
+        create_time_series_embeddings,
+    )
 except ImportError:  # pragma: no cover
     from features_injection import build_injection_lag_features
     from data_validation import validate_and_report, WellDataValidator
@@ -26,6 +31,11 @@ except ImportError:  # pragma: no cover
     from caching import CacheManager, cached
     from physics_loss_advanced import AdaptivePhysicsLoss
     from data_preprocessing_advanced import PhysicsAwarePreprocessor
+    from features_advanced import (
+        create_fourier_features,
+        create_pressure_gradient_features,
+        create_time_series_embeddings,
+    )
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -508,7 +518,7 @@ class PipelineConfig:
     )
     static_exog: List[str] = field(
         default_factory=lambda: [
-            "x", "y", "z",
+            "coord_x", "coord_y", "coord_z",
             # IMPROVEMENT #2: Spatial features
             "well_depth",
             "dist_from_center",
@@ -833,11 +843,17 @@ def run_walk_forward_validation(
             fold_prod = _create_rolling_statistics(fold_prod, feature_cols=["wlpr", "wbhp"], windows=[3, 6, 12])
             
             # IMPROVEMENT #4: Create advanced features (Fourier, pressure gradients, PCA)
-            from features_advanced import create_fourier_features, create_pressure_gradient_features, create_time_series_embeddings
             fold_prod = create_fourier_features(fold_prod, date_col="ds", n_frequencies=3)
             fold_prod = create_pressure_gradient_features(fold_prod, pressure_col="wbhp", rate_col="wlpr")
             key_features = ["wlpr", "wbhp", "womr"] if all(col in fold_prod.columns for col in ["wlpr", "wbhp", "womr"]) else ["wlpr"]
-            fold_prod = create_time_series_embeddings(fold_prod, feature_cols=key_features, window=12, n_components=3)
+            fold_prod = create_time_series_embeddings(
+                fold_prod,
+                feature_cols=key_features,
+                window=12,
+                n_components=3,
+                train_cutoff=cutoff_date,
+                date_col="ds",
+            )
             
             # Fill missing advanced features with zeros (some may not be created for all wells)
             for col in feature_cols:
@@ -1057,6 +1073,9 @@ def _create_spatial_features(df: pd.DataFrame, coords: pd.DataFrame) -> pd.DataF
     """
     df = df.copy()
     coords_dict = coords.set_index("well")[["x", "y", "z"]].to_dict("index")
+    df["coord_x"] = df["well"].map(lambda w: coords_dict.get(str(w), {}).get("x", 0.0))
+    df["coord_y"] = df["well"].map(lambda w: coords_dict.get(str(w), {}).get("y", 0.0))
+    df["coord_z"] = df["well"].map(lambda w: coords_dict.get(str(w), {}).get("z", 0.0))
     
     # Add well depth features
     df["well_depth"] = df["well"].map(lambda w: abs(coords_dict.get(str(w), {}).get("z", 0)))
@@ -1219,7 +1238,6 @@ def prepare_model_frames(
     )
     
     # 4. Fourier features for seasonality (frequency domain)
-    from features_advanced import create_fourier_features, create_pressure_gradient_features, create_time_series_embeddings
     prod_df = create_fourier_features(prod_df, date_col="ds", n_frequencies=3)
     
     # 5. Pressure gradient features (physics-informed derivatives)
@@ -1228,7 +1246,14 @@ def prepare_model_frames(
     # 6. Time series embeddings (PCA compression for pattern recognition)
     # Note: This is computationally expensive, use smaller subset
     key_features = ["wlpr", "wbhp", "womr"] if all(col in prod_df.columns for col in ["wlpr", "wbhp", "womr"]) else ["wlpr"]
-    prod_df = create_time_series_embeddings(prod_df, feature_cols=key_features, window=12, n_components=3)
+    prod_df = create_time_series_embeddings(
+        prod_df,
+        feature_cols=key_features,
+        window=12,
+        n_components=3,
+        train_cutoff=train_cutoff,
+        date_col="ds",
+    )
     
     logger.info("Advanced features created successfully (Total: interactions, spatial, rolling, Fourier, pressure gradients, PCA embeddings)")
     # ============================================================
