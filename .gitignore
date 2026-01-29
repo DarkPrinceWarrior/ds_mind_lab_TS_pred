@@ -65,7 +65,7 @@ lightning_logs/
 *.joblib
 
 # Reports
-*.pdf
+# *.pdf
 
 # Temporary files
 temp_*
