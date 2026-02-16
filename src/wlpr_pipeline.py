@@ -470,49 +470,35 @@ class PipelineConfig:
     )
     hist_exog: List[str] = field(
         default_factory=lambda: [
+            # Raw production/reservoir variables (no target derivatives)
             "wlpt",
             "womt",
             "womr",
-            "wwir",
             "wwit",
             "wthp",
-            "wbhp",
-            "wlpt_diff",
-            "womt_diff",
-            "wwit_diff",
+            # Injection lag features (aggregated from neighbor injectors)
             "inj_wwir_lag_weighted",
             "inj_wwit_diff_lag_weighted",
             "inj_wwir_crm_weighted",
-            # IMPROVEMENT #2: Interaction features
-            "wlpr_x_wbhp",
-            "wlpr_div_wbhp",
-            "wlpr_x_inj_wwir_lag_weighted",
-            "wlpr_div_inj_wwir_lag_weighted",
-            # IMPROVEMENT #2: Rolling statistics (multi-scale)
-            "wlpr_ma3", "wlpr_ma6", "wlpr_ma12",
-            "wlpr_std3", "wlpr_std6", "wlpr_std12",
-            "wbhp_ma3", "wbhp_ma6", "wbhp_ma12",
-            "wbhp_std3", "wbhp_std6", "wbhp_std12",
-            # IMPROVEMENT #4: Advanced features (Fourier, pressure gradients, PCA)
+            # Seasonality (Fourier)
             "fourier_sin_1", "fourier_cos_1", "fourier_sin_2", "fourier_cos_2", "fourier_sin_3", "fourier_cos_3",
-            "wbhp_gradient", "productivity_index", "pressure_rate_product",
+            # PCA embeddings
             "ts_embed_0", "ts_embed_1", "ts_embed_2",
         ]
     )
     futr_exog: List[str] = field(
         default_factory=lambda: [
+            # Calendar / positional (always known in advance)
             "month_sin",
             "month_cos",
             "time_idx",
             "type_prod",
             "type_inj",
-            "wwir",
-            "wwit",
-            "wwit_diff",
+            # Planned injection from neighbors (known ahead)
             "inj_wwir_lag_weighted",
             "inj_wwit_diff_lag_weighted",
             "inj_wwir_crm_weighted",
-            # IMPROVEMENT #4: Fourier features for future exogenous
+            # Seasonality (Fourier, deterministic)
             "fourier_sin_1", "fourier_cos_1", "fourier_sin_2", "fourier_cos_2", "fourier_sin_3", "fourier_cos_3",
         ]
     )
@@ -844,15 +830,10 @@ def run_walk_forward_validation(
             )
             fold_prod = _finalize_prod_dataframe(fold_prod, config)
             
-            # IMPROVEMENT #2: Create advanced features for this fold
-            fold_prod = _create_interaction_features(fold_prod)
+            # Create advanced features for this fold
             fold_prod = _create_spatial_features(fold_prod, coords)
-            fold_prod = _create_rolling_statistics(fold_prod, feature_cols=["wlpr", "wbhp"], windows=[3, 6, 12])
-            
-            # IMPROVEMENT #4: Create advanced features (Fourier, pressure gradients, PCA)
             fold_prod = create_fourier_features(fold_prod, date_col="ds", n_frequencies=3)
-            fold_prod = create_pressure_gradient_features(fold_prod, pressure_col="wbhp", rate_col="wlpr")
-            key_features = ["wlpr", "wbhp", "womr"] if all(col in fold_prod.columns for col in ["wlpr", "wbhp", "womr"]) else ["wlpr"]
+            key_features = ["wlpr", "womr"] if all(col in fold_prod.columns for col in ["wlpr", "womr"]) else ["wlpr"]
             fold_prod = create_time_series_embeddings(
                 fold_prod,
                 feature_cols=key_features,
@@ -903,13 +884,15 @@ def run_walk_forward_validation(
             fold_static_df = static_df
             
         if config.model_type == "chronos2":
+            cov_cols = list(set(config.hist_exog + config.futr_exog))
+            available_cols = [c for c in cov_cols if c in fold_train.columns]
             future_df = pd.concat(
                 [
-                    fold_train[["unique_id", "ds"] + config.futr_exog],
-                    fold_val[["unique_id", "ds"] + config.futr_exog],
+                    fold_train[["unique_id", "ds"] + available_cols],
+                    fold_val[["unique_id", "ds"] + [c for c in available_cols if c in fold_val.columns]],
                 ],
                 ignore_index=True,
-            ).sort_values(["unique_id", "ds"])
+            ).drop_duplicates(subset=["unique_id", "ds"], keep="first").sort_values(["unique_id", "ds"])
             preds = _chronos2_predict(fold_train, future_df, config)
         else:
             model = _create_model(config, n_series=fold_train["unique_id"].nunique())
@@ -1239,30 +1222,16 @@ def prepare_model_frames(
     #                 "WellPINN" (2025), "TimeMixer" (ICLR 2024)
     # Expected: +10-15% R², better pattern capture
     # ============================================================
-    logger.info("Creating advanced features (interactions, spatial, rolling stats, Fourier, PCA, pressure gradients)")
+    logger.info("Creating advanced features (spatial, Fourier, PCA)")
     
-    # 1. Interaction features (wlpr × wbhp, wlpr × injection, etc.)
-    prod_df = _create_interaction_features(prod_df)
-    
-    # 2. Spatial features (depth, distance from center, quadrants)
+    # Spatial features (depth, distance from center, quadrants)
     prod_df = _create_spatial_features(prod_df, coords)
     
-    # 3. Rolling statistics (multi-scale: 3, 6, 12 months)
-    prod_df = _create_rolling_statistics(
-        prod_df,
-        feature_cols=["wlpr", "wbhp"],
-        windows=[3, 6, 12],
-    )
-    
-    # 4. Fourier features for seasonality (frequency domain)
+    # Fourier features for seasonality (frequency domain)
     prod_df = create_fourier_features(prod_df, date_col="ds", n_frequencies=3)
     
-    # 5. Pressure gradient features (physics-informed derivatives)
-    prod_df = create_pressure_gradient_features(prod_df, pressure_col="wbhp", rate_col="wlpr")
-    
-    # 6. Time series embeddings (PCA compression for pattern recognition)
-    # Note: This is computationally expensive, use smaller subset
-    key_features = ["wlpr", "wbhp", "womr"] if all(col in prod_df.columns for col in ["wlpr", "wbhp", "womr"]) else ["wlpr"]
+    # Time series embeddings (PCA compression for pattern recognition)
+    key_features = ["wlpr", "womr"] if all(col in prod_df.columns for col in ["wlpr", "womr"]) else ["wlpr"]
     prod_df = create_time_series_embeddings(
         prod_df,
         feature_cols=key_features,
@@ -1272,7 +1241,7 @@ def prepare_model_frames(
         date_col="ds",
     )
     
-    logger.info("Advanced features created successfully (Total: interactions, spatial, rolling, Fourier, pressure gradients, PCA embeddings)")
+    logger.info("Advanced features created successfully (spatial, Fourier, PCA embeddings)")
     # ============================================================
     
     # Fill missing advanced features with zeros (some may not be created for all wells)
@@ -1563,83 +1532,144 @@ def _chronos2_predict(
     future_df: pd.DataFrame,
     config: PipelineConfig,
 ) -> pd.DataFrame:
+    """Generate forecasts using Chronos-2 zero-shot model.
+
+    Key design decisions aligned with the Chronos-2 paper and Darts API:
+
+    1. **Multivariate target via group attention**: All wells are stacked into a
+       single multivariate ``TimeSeries`` so that Chronos-2's group attention
+       mechanism can share information across related production series
+       (cross-learning).  The model internally assigns the same group ID to all
+       components and exchanges context through the group attention layer.
+
+    2. **Covariate temporal alignment**: Darts requires past_covariates to span
+       at least ``input_chunk_length`` history points *and*, when
+       ``n > output_chunk_length``, an additional
+       ``n - output_chunk_length`` future points.  Future covariates must cover
+       the historical ``input_chunk_length`` *plus* the ``n`` forecast steps.
+       We therefore build both covariate TimeSeries from the concatenation of
+       train and future data so the full time axis is available.
+
+    3. **Prediction unpacking**: Because the target is multivariate, the single
+       returned ``TimeSeries`` contains one component per well.  We unpack it
+       back into the ``(unique_id, ds, y_hat)`` long format expected by the
+       rest of the pipeline.
+    """
     TimeSeries, _ = _import_chronos2()
     series_ids = sorted(train_df["unique_id"].unique())
     if not series_ids:
         raise ValueError("No series available for Chronos2 forecasting.")
 
-    train_series = []
-    past_covs = []
-    future_covs = []
+    past_cov_cols = [col for col in config.hist_exog if col in train_df.columns]
+    future_cov_cols = [col for col in config.futr_exog if col in future_df.columns]
+    use_past_cov = bool(past_cov_cols)
+    use_future_cov = bool(future_cov_cols)
 
-    use_past_cov = bool(config.hist_exog)
-    use_future_cov = bool(config.futr_exog)
+    all_cov_cols = list(dict.fromkeys(past_cov_cols + future_cov_cols))
+    train_select = ["unique_id", "ds", "y"] + [c for c in all_cov_cols if c in train_df.columns]
+    future_select = ["unique_id", "ds"] + [c for c in all_cov_cols if c in future_df.columns]
 
-    for uid in series_ids:
-        train_slice = train_df[train_df["unique_id"] == uid].sort_values("ds")
-        future_slice = future_df[future_df["unique_id"] == uid].sort_values("ds")
-        if train_slice.empty:
-            continue
+    full_df = pd.concat(
+        [
+            train_df[train_select],
+            future_df[future_select].assign(y=np.nan),
+        ],
+        ignore_index=True,
+    )
+    full_df = full_df.drop_duplicates(subset=["unique_id", "ds"], keep="first")
+    full_df = full_df.sort_values(["unique_id", "ds"])
 
-        train_series.append(
-            TimeSeries.from_dataframe(train_slice, time_col="ds", value_cols="y")
-        )
+    # --- build multivariate target (one component per well) for group attention ---
+    target_pivot = full_df[full_df["unique_id"].isin(series_ids)].pivot(
+        index="ds", columns="unique_id", values="y",
+    ).sort_index()
+    target_pivot.columns = [str(c) for c in target_pivot.columns]
 
-        if use_past_cov:
-            past_cols = [col for col in config.hist_exog if col in train_slice.columns]
-            past_covs.append(
-                TimeSeries.from_dataframe(train_slice, time_col="ds", value_cols=past_cols)
-            )
+    train_end = train_df["ds"].max()
+    train_pivot = target_pivot.loc[target_pivot.index <= train_end]
+    if train_pivot.empty:
+        raise ValueError("Empty training window for Chronos-2.")
 
-        if use_future_cov:
-            future_cols = [col for col in config.futr_exog if col in future_slice.columns]
-            future_covs.append(
-                TimeSeries.from_dataframe(future_slice, time_col="ds", value_cols=future_cols)
-            )
+    target_ts = TimeSeries.from_dataframe(
+        train_pivot.reset_index(),
+        time_col="ds",
+        value_cols=list(train_pivot.columns),
+    ).astype(np.float32)
 
-    model = _build_chronos2_model(config)
-    fit_kwargs = {"series": train_series, "verbose": False}
-    predict_kwargs = {"n": config.horizon, "series": train_series}
-
+    # --- past covariates: must cover history; Darts slices automatically ---
+    past_cov_ts = None
     if use_past_cov:
-        fit_kwargs["past_covariates"] = past_covs
-        predict_kwargs["past_covariates"] = past_covs
+        past_frames = []
+        for uid in series_ids:
+            uid_full = full_df[full_df["unique_id"] == uid].set_index("ds")[past_cov_cols]
+            uid_full = uid_full.rename(columns={c: f"{uid}__{c}" for c in past_cov_cols})
+            past_frames.append(uid_full)
+        past_merged = pd.concat(past_frames, axis=1).sort_index().fillna(0.0)
+        past_cov_ts = TimeSeries.from_dataframe(
+            past_merged.reset_index(), time_col="ds",
+            value_cols=list(past_merged.columns),
+        ).astype(np.float32)
+
+    # --- future covariates: must cover history (input_chunk_length) + forecast (n) ---
+    future_cov_ts = None
     if use_future_cov:
-        fit_kwargs["future_covariates"] = future_covs
-        predict_kwargs["future_covariates"] = future_covs
+        futr_frames = []
+        for uid in series_ids:
+            uid_full = full_df[full_df["unique_id"] == uid].set_index("ds")[future_cov_cols]
+            uid_full = uid_full.rename(columns={c: f"{uid}__{c}" for c in future_cov_cols})
+            futr_frames.append(uid_full)
+        futr_merged = pd.concat(futr_frames, axis=1).sort_index().fillna(0.0)
+        future_cov_ts = TimeSeries.from_dataframe(
+            futr_merged.reset_index(), time_col="ds",
+            value_cols=list(futr_merged.columns),
+        ).astype(np.float32)
+
+    # --- fit (training-free, but required for Darts internal bookkeeping) ---
+    model = _build_chronos2_model(config)
+
+    fit_kwargs: Dict[str, Any] = {"series": target_ts, "verbose": False}
+    predict_kwargs: Dict[str, Any] = {"n": config.horizon, "series": target_ts}
+
+    if past_cov_ts is not None:
+        fit_kwargs["past_covariates"] = past_cov_ts
+        predict_kwargs["past_covariates"] = past_cov_ts
+    if future_cov_ts is not None:
+        fit_kwargs["future_covariates"] = future_cov_ts
+        predict_kwargs["future_covariates"] = future_cov_ts
 
     model.fit(**fit_kwargs)
-    preds = model.predict(**predict_kwargs)
+    preds_ts = model.predict(**predict_kwargs)
 
-    if not isinstance(preds, list):
-        preds = [preds]
+    # --- unpack multivariate prediction back to long format ---
+    pred_wide = preds_ts.to_dataframe().reset_index()
+    time_col = pred_wide.columns[0]
+    value_cols = [c for c in pred_wide.columns if c != time_col]
 
-    pred_frames = []
-    for uid, pred in zip(series_ids, preds):
-        pred_df = pred.to_dataframe().reset_index()
-        time_col = pred_df.columns[0]
-        value_cols = [col for col in pred_df.columns if col != time_col]
-        if not value_cols:
-            raise ValueError("Chronos2 prediction returned no value columns.")
-        pred_df = pred_df.rename(columns={time_col: "ds", value_cols[0]: "y_hat"})
-        pred_df["unique_id"] = uid
-        pred_frames.append(pred_df[["unique_id", "ds", "y_hat"]])
+    pred_frames: List[pd.DataFrame] = []
+    for col in value_cols:
+        uid = col
+        frame = pred_wide[[time_col, col]].rename(
+            columns={time_col: "ds", col: "y_hat"},
+        )
+        frame["unique_id"] = uid
+        pred_frames.append(frame[["unique_id", "ds", "y_hat"]])
 
-    pred_df = pd.concat(pred_frames, ignore_index=True)
-    return pred_df
+    return pd.concat(pred_frames, ignore_index=True)
 
 
 def train_and_forecast(frames: Dict[str, pd.DataFrame], config: PipelineConfig) -> pd.DataFrame:
     if config.model_type == "chronos2":
         train_df = frames["train_df"]
         test_df = frames["test_df"]
+        cov_cols = list(set(config.hist_exog + config.futr_exog))
+        available_cols = [c for c in cov_cols if c in train_df.columns]
         future_df = pd.concat(
             [
-                train_df[["unique_id", "ds"] + config.futr_exog],
-                test_df[["unique_id", "ds"] + config.futr_exog],
+                train_df[["unique_id", "ds"] + available_cols],
+                test_df[["unique_id", "ds"] + [c for c in available_cols if c in test_df.columns]],
             ],
             ignore_index=True,
-        ).sort_values(["unique_id", "ds"])
+        ).drop_duplicates(subset=["unique_id", "ds"], keep="first").sort_values(["unique_id", "ds"])
         preds = _chronos2_predict(train_df, future_df, config)
         logger.info("Generated %d Chronos2 forecast rows", len(preds))
         return preds
