@@ -76,20 +76,14 @@ def load_raw_data(path: Path, validate: bool = True) -> pd.DataFrame:
     logger.info("Loaded %d rows for %d wells", len(df), df["well"].nunique())
 
     try:
-        logger.info("Applying physics-aware preprocessing")
+        logger.info("Applying physics-aware preprocessing (leakage-safe: imputation only)")
         preprocessor = PhysicsAwarePreprocessor(well_type="PROD")
         df = preprocessor.detect_structural_breaks(df, rate_col="wlpr", threshold=0.7)
         rate_cols = [col for col in ["wlpr", "womr", "wwir"] if col in df.columns]
         cumulative_cols = [col for col in ["wlpt", "womt", "wwit"] if col in df.columns]
         if rate_cols or cumulative_cols:
             df = preprocessor.physics_aware_imputation(df, rate_cols=rate_cols, cumulative_cols=cumulative_cols)
-        feature_cols = [col for col in ["wlpr", "wbhp", "wwir"] if col in df.columns]
-        if len(feature_cols) >= 2:
-            df = preprocessor.detect_outliers_multivariate(df, feature_cols=feature_cols, contamination=0.05)
-        rate_cols_smooth = [col for col in ["wlpr", "womr"] if col in df.columns]
-        if rate_cols_smooth:
-            df = preprocessor.smooth_rates_savgol(df, rate_cols=rate_cols_smooth, window_length=7, polyorder=2)
-        logger.info("Physics-aware preprocessing completed")
+        logger.info("Physics-aware preprocessing (imputation) completed")
     except Exception as exc:
         logger.warning("Physics-aware preprocessing failed: %s", exc)
 
@@ -504,6 +498,7 @@ def prepare_model_frames(
     prod_df = _compute_watercut(prod_df)
     prod_df["wlpr"] = prod_df["wlpr"].fillna(0.0)
 
+    # Compute test_start early so we can limit preprocessing to train data
     max_dates = prod_df.groupby("well")["ds"].max()
     if max_dates.empty:
         raise ValueError("Could not compute terminal dates for producers.")
@@ -520,6 +515,31 @@ def prepare_model_frames(
         raise ValueError("Producer dataframe has no valid dates after preprocessing.")
     if train_cutoff < min_date:
         train_cutoff = min_date
+
+    # Outlier detection and smoothing on train portion only (no test leakage)
+    try:
+        preprocessor = PhysicsAwarePreprocessor(well_type="PROD")
+        train_mask = prod_df["ds"] < test_start
+        train_part = prod_df.loc[train_mask].copy()
+        test_part = prod_df.loc[~train_mask].copy()
+
+        feature_cols_ol = [col for col in ["wlpr", "wbhp", "wwir"] if col in train_part.columns]
+        if len(feature_cols_ol) >= 2:
+            train_part = preprocessor.detect_outliers_multivariate(
+                train_part, feature_cols=feature_cols_ol,
+                contamination=config.preprocessing_outlier_contamination,
+            )
+        rate_cols_smooth = [col for col in ["wlpr", "womr"] if col in train_part.columns]
+        if rate_cols_smooth:
+            train_part = preprocessor.smooth_rates_savgol(
+                train_part, rate_cols=rate_cols_smooth,
+                window_length=config.preprocessing_smooth_window_length,
+                polyorder=config.preprocessing_smooth_polyorder,
+            )
+        prod_df = pd.concat([train_part, test_part], ignore_index=True).sort_values(["well", "ds"])
+        logger.info("Outlier detection and smoothing applied to train data only (before %s)", test_start.date())
+    except Exception as exc:
+        logger.warning("Train-only preprocessing failed: %s", exc)
 
     prod_base = prod_df.copy()
     inj_raw = raw_df[raw_df["type"] == "INJ"].copy()
