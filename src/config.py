@@ -52,6 +52,7 @@ class PipelineConfig:
     preprocessing_outlier_contamination: float = 0.05
     preprocessing_smooth_window_length: int = 7
     preprocessing_smooth_polyorder: int = 2
+    preprocessing_bilateral_sigma_space: float = 3.0
     # Graph feature parameters
     graph_n2v_dimensions: int = 4
     graph_spectral_components: int = 4

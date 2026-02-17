@@ -550,10 +550,10 @@ def prepare_model_frames(
             )
         rate_cols_smooth = [col for col in ["wlpr", "womr"] if col in train_part.columns]
         if rate_cols_smooth:
-            train_part = preprocessor.smooth_rates_savgol(
+            train_part = preprocessor.smooth_rates_bilateral(
                 train_part, rate_cols=rate_cols_smooth,
                 window_length=config.preprocessing_smooth_window_length,
-                polyorder=config.preprocessing_smooth_polyorder,
+                sigma_space=config.preprocessing_bilateral_sigma_space,
             )
         prod_df = pd.concat([train_part, test_part], ignore_index=True).sort_values(["well", "ds"])
         logger.info("Outlier detection and smoothing applied to train data only (before %s)", test_start.date())

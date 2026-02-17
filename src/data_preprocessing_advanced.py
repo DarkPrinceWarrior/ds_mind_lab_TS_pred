@@ -250,6 +250,68 @@ class PhysicsAwarePreprocessor:
         
         return df
 
+    def smooth_rates_bilateral(
+        self,
+        df: pd.DataFrame,
+        rate_cols: List[str],
+        window_length: int = 7,
+        sigma_space: float = 3.0,
+        sigma_range: Optional[float] = None,
+    ) -> pd.DataFrame:
+        """Apply adaptive bilateral Gaussian filter to smooth noisy rate data.
+
+        Unlike Savitzky-Golay, bilateral filter preserves sharp transitions
+        (shutdowns, startups) while smoothing gradual noise. Each sample is
+        weighted by both temporal proximity (sigma_space) and value similarity
+        (sigma_range), so large jumps are not blurred.
+
+        Args:
+            df: Well data with columns [well] + rate_cols.
+            rate_cols: Rate columns to smooth.
+            window_length: Half-window size (full window = 2*window_length+1).
+            sigma_space: Std-dev of the spatial (temporal) Gaussian kernel.
+            sigma_range: Std-dev of the range (value) Gaussian kernel.
+                If None, set to per-well MAD (median absolute deviation) of
+                differences -- automatically adapts to signal volatility.
+
+        Returns:
+            DataFrame with ``{col}_smooth`` columns added.
+        """
+        df = df.copy()
+        hw = window_length
+
+        for well in df["well"].unique():
+            well_mask = df["well"] == well
+            for col in rate_cols:
+                if col not in df.columns:
+                    continue
+                values = df.loc[well_mask, col].values.astype(float)
+                n = len(values)
+                if n < 3:
+                    continue
+
+                sr = sigma_range
+                if sr is None:
+                    diffs = np.abs(np.diff(values))
+                    mad = float(np.median(diffs)) if len(diffs) > 0 else 1.0
+                    sr = max(mad * 1.4826, 1e-6)
+
+                smoothed = np.empty(n)
+                for i in range(n):
+                    lo = max(0, i - hw)
+                    hi = min(n, i + hw + 1)
+                    window = values[lo:hi]
+                    offsets = np.arange(lo - i, hi - i)
+                    w_space = np.exp(-0.5 * (offsets / sigma_space) ** 2)
+                    w_range = np.exp(-0.5 * ((window - values[i]) / sr) ** 2)
+                    w = w_space * w_range
+                    total = w.sum()
+                    smoothed[i] = (w * window).sum() / total if total > 0 else values[i]
+
+                df.loc[well_mask, f"{col}_smooth"] = smoothed
+
+        return df
+
 
 def create_decline_features(df: pd.DataFrame, rate_col: str = "wlpr") -> pd.DataFrame:
     """Create decline curve features for better forecasting.
