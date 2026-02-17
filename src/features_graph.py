@@ -208,6 +208,136 @@ def compute_spectral_embeddings(
 
 
 # ---------------------------------------------------------------------------
+# DTW similarity between well production curves
+# ---------------------------------------------------------------------------
+
+def _dtw_distance(s1: np.ndarray, s2: np.ndarray) -> float:
+    """Compute DTW distance between two 1-D time series using full cost matrix."""
+    n, m = len(s1), len(s2)
+    cost = np.full((n + 1, m + 1), np.inf)
+    cost[0, 0] = 0.0
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            d = (s1[i - 1] - s2[j - 1]) ** 2
+            cost[i, j] = d + min(cost[i - 1, j], cost[i, j - 1], cost[i - 1, j - 1])
+    return float(np.sqrt(cost[n, m]))
+
+
+def compute_dtw_similarity_matrix(
+    df: pd.DataFrame,
+    target_wells: List[str],
+    value_col: str = "wlpr",
+    sigma: Optional[float] = None,
+    train_cutoff: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """Compute pairwise DTW similarity matrix between well production curves.
+
+    Uses the rate-of-change (diff) of *value_col* following STA-MGCN paper:
+    DTW on derivative curves captures shape similarity regardless of scale.
+
+    Similarity = exp(-dtw_dist^2 / (2 * sigma^2))  (Gaussian kernel).
+    If *sigma* is None, it is set to the median DTW distance (self-tuning).
+
+    Only uses data up to *train_cutoff* to prevent leakage.
+    """
+    well_curves: Dict[str, np.ndarray] = {}
+    for well in target_wells:
+        mask = df["well"].astype(str) == str(well)
+        if train_cutoff is not None:
+            mask = mask & (df["ds"] <= train_cutoff)
+        series = df.loc[mask].sort_values("ds")[value_col].values
+        diff = np.diff(series) if len(series) > 1 else np.array([0.0])
+        mu, std = diff.mean(), diff.std()
+        well_curves[well] = (diff - mu) / std if std > 1e-9 else diff - mu
+
+    n = len(target_wells)
+    dist_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = _dtw_distance(well_curves[target_wells[i]], well_curves[target_wells[j]])
+            dist_matrix[i, j] = d
+            dist_matrix[j, i] = d
+
+    if sigma is None:
+        upper = dist_matrix[np.triu_indices(n, k=1)]
+        sigma = float(np.median(upper)) if len(upper) > 0 else 1.0
+    sigma = max(sigma, 1e-9)
+
+    sim_matrix = np.exp(-dist_matrix ** 2 / (2 * sigma ** 2))
+    np.fill_diagonal(sim_matrix, 0.0)
+
+    sim_df = pd.DataFrame(sim_matrix, index=target_wells, columns=target_wells)
+    logger.info(
+        "Computed DTW similarity matrix for %d wells (sigma=%.2f, median_dist=%.2f)",
+        n, sigma, float(np.median(dist_matrix[np.triu_indices(n, k=1)])) if n > 1 else 0.0,
+    )
+    return sim_df
+
+
+def compute_dtw_neighbor_aggregated_features(
+    df: pd.DataFrame,
+    dtw_sim: pd.DataFrame,
+    feature_cols: List[str],
+    k: int = 5,
+) -> pd.DataFrame:
+    """Weighted average of neighbors' features using DTW similarity weights.
+
+    Same logic as geographic neighbor aggregation but uses DTW-based
+    similarity instead of distance-based proximity.
+
+    New columns: ``dtw_neighbor_avg_{col}`` for each col in *feature_cols*.
+    """
+    df = df.copy()
+    wells = sorted(df["well"].astype(str).unique())
+    new_cols = [f"dtw_neighbor_avg_{col}" for col in feature_cols]
+    for col in new_cols:
+        df[col] = 0.0
+
+    neighbor_weights: Dict[str, List[Tuple[str, float]]] = {}
+    for well in wells:
+        if well not in dtw_sim.index:
+            neighbor_weights[well] = []
+            continue
+        sims = dtw_sim.loc[well].to_dict()
+        neighbors = [(nbr, w) for nbr, w in sims.items() if nbr != well and w > 0]
+        neighbors.sort(key=lambda x: x[1], reverse=True)
+        neighbors = neighbors[:k]
+        total_w = sum(w for _, w in neighbors)
+        if total_w > 0:
+            neighbors = [(n, w / total_w) for n, w in neighbors]
+        neighbor_weights[well] = neighbors
+
+    dates = sorted(df["ds"].unique())
+    for date in dates:
+        date_mask = df["ds"] == date
+        date_data = df.loc[date_mask].copy()
+        date_data["well"] = date_data["well"].astype(str)
+        date_data = date_data.set_index("well")
+        for well in wells:
+            if well not in date_data.index:
+                continue
+            well_mask = date_mask & (df["well"].astype(str) == well)
+            nbrs = neighbor_weights.get(well, [])
+            if not nbrs:
+                continue
+            agg = np.zeros(len(feature_cols))
+            for nbr, w in nbrs:
+                if nbr in date_data.index:
+                    vals = date_data.loc[nbr, feature_cols]
+                    if isinstance(vals, pd.DataFrame):
+                        vals = vals.iloc[0]
+                    agg += w * vals.astype(float).fillna(0.0).values
+            for i, col in enumerate(feature_cols):
+                df.loc[well_mask, f"dtw_neighbor_avg_{col}"] = agg[i]
+
+    logger.info(
+        "Computed DTW neighbor-aggregated features for %d columns x %d wells",
+        len(feature_cols), len(wells),
+    )
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Neighbor-aggregated production (1-hop GCN-style message passing)
 # ---------------------------------------------------------------------------
 
@@ -343,6 +473,10 @@ def build_graph_features(
     neighbor_agg_cols: Optional[List[str]] = None,
     neighbor_k: int = 5,
     seed: int = 42,
+    dtw_agg_cols: Optional[List[str]] = None,
+    dtw_k: int = 5,
+    dtw_value_col: str = "wlpr",
+    train_cutoff: Optional[pd.Timestamp] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Build all graph-based features and merge into prod_df.
 
@@ -382,8 +516,21 @@ def build_graph_features(
                 prod_df, G, feature_cols=available, k=neighbor_k,
             )
 
+    # DTW-based neighbor aggregation (dynamic similarity graph)
+    if dtw_agg_cols:
+        available_dtw = [c for c in dtw_agg_cols if c in prod_df.columns]
+        if available_dtw and dtw_value_col in prod_df.columns:
+            dtw_sim = compute_dtw_similarity_matrix(
+                prod_df, target_wells,
+                value_col=dtw_value_col,
+                train_cutoff=train_cutoff,
+            )
+            prod_df = compute_dtw_neighbor_aggregated_features(
+                prod_df, dtw_sim, feature_cols=available_dtw, k=dtw_k,
+            )
+
     logger.info(
-        "Graph features complete: %d static cols + neighbor aggregation for %d cols",
-        len(static_cols), len(neighbor_agg_cols or []),
+        "Graph features complete: %d static cols + geo-neighbor for %d cols + dtw-neighbor for %d cols",
+        len(static_cols), len(neighbor_agg_cols or []), len(dtw_agg_cols or []),
     )
     return prod_df, static_df

@@ -399,6 +399,9 @@ def run_walk_forward_validation(
                 neighbor_agg_cols=config.graph_neighbor_agg_cols,
                 neighbor_k=config.graph_neighbor_k,
                 seed=config.random_seed,
+                dtw_agg_cols=config.graph_dtw_agg_cols,
+                dtw_k=config.graph_dtw_k,
+                train_cutoff=cutoff_date,
             )
             fold_prod = _fill_missing_features(fold_prod, feature_cols, context=f"Fold {split['fold']}: ")
             train_keys = fold_train_raw[["unique_id", "ds"]].drop_duplicates()
@@ -577,6 +580,9 @@ def prepare_model_frames(
         neighbor_agg_cols=config.graph_neighbor_agg_cols,
         neighbor_k=config.graph_neighbor_k,
         seed=config.random_seed,
+        dtw_agg_cols=config.graph_dtw_agg_cols,
+        dtw_k=config.graph_dtw_k,
+        train_cutoff=train_cutoff,
     )
     logger.info("Advanced + graph features created successfully")
 

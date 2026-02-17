@@ -59,6 +59,11 @@ class PipelineConfig:
     graph_neighbor_agg_cols: List[str] = field(
         default_factory=lambda: ["wlpr", "womr"],
     )
+    # DTW-based dynamic similarity graph parameters
+    graph_dtw_agg_cols: List[str] = field(
+        default_factory=lambda: ["wlpr", "womr"],
+    )
+    graph_dtw_k: int = 5
     # Feature lists
     # NOTE: Removed type_prod/type_inj (constant per well) and time_idx
     # (redundant with Chronos-2 positional encoding).
@@ -71,6 +76,7 @@ class PipelineConfig:
             "fourier_sin_1", "fourier_cos_1", "fourier_sin_2", "fourier_cos_2", "fourier_sin_3", "fourier_cos_3",
             "ts_embed_0", "ts_embed_1", "ts_embed_2",
             "neighbor_avg_wlpr", "neighbor_avg_womr",
+            "dtw_neighbor_avg_wlpr", "dtw_neighbor_avg_womr",
         ]
     )
     futr_exog: List[str] = field(
