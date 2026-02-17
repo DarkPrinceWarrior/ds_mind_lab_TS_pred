@@ -402,6 +402,9 @@ def run_walk_forward_validation(
                 dtw_agg_cols=config.graph_dtw_agg_cols,
                 dtw_k=config.graph_dtw_k,
                 train_cutoff=cutoff_date,
+                sparsify_graph=config.graph_sparsify,
+                sparsify_max_k=config.graph_sparsify_max_k,
+                sparsify_inter_quantile=config.graph_sparsify_inter_quantile,
             )
             fold_prod = _fill_missing_features(fold_prod, feature_cols, context=f"Fold {split['fold']}: ")
             train_keys = fold_train_raw[["unique_id", "ds"]].drop_duplicates()
@@ -583,6 +586,9 @@ def prepare_model_frames(
         dtw_agg_cols=config.graph_dtw_agg_cols,
         dtw_k=config.graph_dtw_k,
         train_cutoff=train_cutoff,
+        sparsify_graph=config.graph_sparsify,
+        sparsify_max_k=config.graph_sparsify_max_k,
+        sparsify_inter_quantile=config.graph_sparsify_inter_quantile,
     )
     logger.info("Advanced + graph features created successfully")
 

@@ -16,6 +16,8 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 from scipy.sparse.csgraph import laplacian
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,106 @@ def build_well_graph(
 
     logger.info("Built well graph: %d nodes, %d edges", G.number_of_nodes(), G.number_of_edges())
     return G
+
+
+# ---------------------------------------------------------------------------
+# Production clustering + graph sparsification (SGP-GCN)
+# ---------------------------------------------------------------------------
+
+def cluster_wells_by_production(
+    df: pd.DataFrame,
+    target_wells: List[str],
+    value_col: str = "wlpr",
+    max_k: int = 4,
+    train_cutoff: Optional[pd.Timestamp] = None,
+) -> Dict[str, int]:
+    """Cluster wells by normalized production profile using K-Means.
+
+    Selects optimal cluster count (2..max_k) via silhouette score.
+    Returns mapping well_id -> cluster_label.
+    """
+    profiles = []
+    well_order = []
+    for well in target_wells:
+        mask = df["well"].astype(str) == str(well)
+        if train_cutoff is not None:
+            mask = mask & (df["ds"] <= train_cutoff)
+        series = df.loc[mask].sort_values("ds")[value_col].values.astype(float)
+        if len(series) == 0:
+            series = np.array([0.0])
+        mu, std = series.mean(), series.std()
+        normed = (series - mu) / std if std > 1e-9 else series - mu
+        profiles.append(normed)
+        well_order.append(well)
+
+    # Pad/truncate to common length
+    max_len = max(len(p) for p in profiles)
+    X = np.zeros((len(profiles), max_len))
+    for i, p in enumerate(profiles):
+        X[i, :len(p)] = p
+
+    if len(well_order) < 3:
+        return {w: 0 for w in well_order}
+
+    best_k, best_score, best_labels = 2, -1.0, None
+    for k in range(2, min(max_k + 1, len(well_order))):
+        km = KMeans(n_clusters=k, n_init=10, random_state=42)
+        labels = km.fit_predict(X)
+        score = silhouette_score(X, labels)
+        if score > best_score:
+            best_k, best_score, best_labels = k, score, labels
+
+    cluster_map = {well_order[i]: int(best_labels[i]) for i in range(len(well_order))}
+    cluster_sizes = {}
+    for lbl in best_labels:
+        cluster_sizes[int(lbl)] = cluster_sizes.get(int(lbl), 0) + 1
+
+    logger.info(
+        "Production clustering: k=%d, silhouette=%.3f, sizes=%s",
+        best_k, best_score, cluster_sizes,
+    )
+    return cluster_map
+
+
+def sparsify_graph_by_clusters(
+    G: nx.Graph,
+    cluster_map: Dict[str, int],
+    inter_cluster_quantile: float = 0.5,
+) -> nx.Graph:
+    """Remove weak inter-cluster edges from the graph (SGP-GCN SPC algorithm).
+
+    Edges between wells in the same cluster are kept.
+    Edges between wells in different clusters are removed if their
+    proximity weight is below the *inter_cluster_quantile* of all
+    inter-cluster edge weights.
+
+    Returns a new (pruned) graph; the original is not modified.
+    """
+    G_sparse = G.copy()
+    inter_weights = []
+    inter_edges = []
+    for u, v, data in G.edges(data=True):
+        cu = cluster_map.get(str(u), -1)
+        cv = cluster_map.get(str(v), -1)
+        if cu != cv and cu >= 0 and cv >= 0:
+            inter_weights.append(data.get("proximity", 0.0))
+            inter_edges.append((u, v))
+
+    if not inter_weights:
+        return G_sparse
+
+    threshold = float(np.quantile(inter_weights, inter_cluster_quantile))
+    removed = 0
+    for (u, v), w in zip(inter_edges, inter_weights):
+        if w < threshold:
+            G_sparse.remove_edge(u, v)
+            removed += 1
+
+    logger.info(
+        "Graph sparsification: removed %d/%d inter-cluster edges (threshold=%.6f, quantile=%.0f%%)",
+        removed, len(inter_edges), threshold, inter_cluster_quantile * 100,
+    )
+    return G_sparse
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +579,9 @@ def build_graph_features(
     dtw_k: int = 5,
     dtw_value_col: str = "wlpr",
     train_cutoff: Optional[pd.Timestamp] = None,
+    sparsify_graph: bool = True,
+    sparsify_max_k: int = 4,
+    sparsify_inter_quantile: float = 0.5,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Build all graph-based features and merge into prod_df.
 
@@ -486,6 +591,7 @@ def build_graph_features(
     """
     G = build_well_graph(coords, distances=distances, well_types=well_types)
 
+    # Centrality & embeddings use the full (dense) graph
     centrality = compute_centrality_features(G)
     n2v = compute_node2vec_embeddings(G, dimensions=n2v_dimensions, seed=seed)
     spectral = compute_spectral_embeddings(G, n_components=spectral_components)
@@ -509,11 +615,24 @@ def build_graph_features(
         mapping = static_df.set_index("well")[col].to_dict()
         prod_df[col] = prod_df[well_col].astype(str).map(mapping).fillna(0.0)
 
+    # Production clustering + graph sparsification for neighbor aggregation
+    G_agg = G
+    if sparsify_graph and len(target_wells) >= 3:
+        cluster_map = cluster_wells_by_production(
+            prod_df, target_wells,
+            value_col=dtw_value_col if dtw_value_col in prod_df.columns else "wlpr",
+            max_k=sparsify_max_k,
+            train_cutoff=train_cutoff,
+        )
+        G_agg = sparsify_graph_by_clusters(G, cluster_map, inter_cluster_quantile=sparsify_inter_quantile)
+        # Store cluster labels as a static feature
+        prod_df["prod_cluster"] = prod_df[well_col].astype(str).map(cluster_map).fillna(-1).astype(int)
+
     if neighbor_agg_cols:
         available = [c for c in neighbor_agg_cols if c in prod_df.columns]
         if available:
             prod_df = compute_neighbor_aggregated_features(
-                prod_df, G, feature_cols=available, k=neighbor_k,
+                prod_df, G_agg, feature_cols=available, k=neighbor_k,
             )
 
     # DTW-based neighbor aggregation (dynamic similarity graph)

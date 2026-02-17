@@ -64,6 +64,10 @@ class PipelineConfig:
         default_factory=lambda: ["wlpr", "womr"],
     )
     graph_dtw_k: int = 5
+    # Production clustering + graph sparsification (SGP-GCN SPC)
+    graph_sparsify: bool = True
+    graph_sparsify_max_k: int = 4
+    graph_sparsify_inter_quantile: float = 0.5
     # Feature lists
     # NOTE: Removed type_prod/type_inj (constant per well) and time_idx
     # (redundant with Chronos-2 positional encoding).
