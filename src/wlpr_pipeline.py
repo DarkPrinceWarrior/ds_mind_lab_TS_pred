@@ -390,6 +390,19 @@ def run_walk_forward_validation(
             fold_prod = create_time_series_embeddings(
                 fold_prod, feature_cols=key_features, window=12, n_components=3, train_cutoff=cutoff_date, date_col="ds",
             )
+            # Productivity Index J(t) for fold
+            if "wthp" in fold_prod.columns and "wlpr" in fold_prod.columns:
+                fw = "well" if "well" in fold_prod.columns else "unique_id"
+                ftrain_mask = fold_prod["ds"] <= cutoff_date
+                fp_ref = fold_prod.loc[ftrain_mask & (fold_prod["wthp"] > 0)].groupby(fw)["wthp"].quantile(0.95)
+                fold_prod["_p_ref"] = fold_prod[fw].map(fp_ref)
+                fdp = (fold_prod["_p_ref"] - fold_prod["wthp"]).clip(lower=1.0)
+                fold_prod["productivity_index"] = fold_prod["wlpr"] / fdp
+                fold_prod["dp_drawdown"] = fdp
+                fold_prod = fold_prod.drop(columns=["_p_ref"])
+                fold_prod["productivity_index"] = fold_prod["productivity_index"].fillna(0.0)
+                fold_prod["dp_drawdown"] = fold_prod["dp_drawdown"].fillna(0.0)
+
             fold_target_wells = sorted(fold_prod["well"].unique()) if "well" in fold_prod.columns else sorted(fold_prod["unique_id"].unique())
             fold_prod, _ = build_graph_features(
                 fold_prod, coords, fold_target_wells, fold_pair_summary if fold_pair_summary is not None else pd.DataFrame(),
@@ -572,6 +585,20 @@ def prepare_model_frames(
     prod_df = create_time_series_embeddings(
         prod_df, feature_cols=key_features, window=12, n_components=3, train_cutoff=train_cutoff, date_col="ds",
     )
+
+    # Productivity Index J(t) = wlpr / (P_ref - wthp) [PI-GNN inspired]
+    if "wthp" in prod_df.columns and "wlpr" in prod_df.columns:
+        well_col = "well" if "well" in prod_df.columns else "unique_id"
+        train_mask = prod_df["ds"] <= train_cutoff
+        p_ref = prod_df.loc[train_mask & (prod_df["wthp"] > 0)].groupby(well_col)["wthp"].quantile(0.95)
+        prod_df["_p_ref"] = prod_df[well_col].map(p_ref)
+        dp = (prod_df["_p_ref"] - prod_df["wthp"]).clip(lower=1.0)
+        prod_df["productivity_index"] = prod_df["wlpr"] / dp
+        prod_df["dp_drawdown"] = dp
+        prod_df = prod_df.drop(columns=["_p_ref"])
+        prod_df["productivity_index"] = prod_df["productivity_index"].fillna(0.0)
+        prod_df["dp_drawdown"] = prod_df["dp_drawdown"].fillna(0.0)
+        logger.info("Computed productivity index J(t) and drawdown dp for %d wells", prod_df[well_col].nunique())
 
     well_types = raw_df.sort_values("date").groupby("well").tail(1).set_index("well")["type"].to_dict()
     prod_df, _graph_static = build_graph_features(

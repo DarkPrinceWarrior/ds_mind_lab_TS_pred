@@ -81,6 +81,7 @@ class PipelineConfig:
             "ts_embed_0", "ts_embed_1", "ts_embed_2",
             "neighbor_avg_wlpr", "neighbor_avg_womr",
             "dtw_neighbor_avg_wlpr", "dtw_neighbor_avg_womr",
+            "productivity_index", "dp_drawdown",
         ]
     )
     futr_exog: List[str] = field(
