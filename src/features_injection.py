@@ -434,6 +434,8 @@ def _build_weighted_matrices(
     lagged_rate = pd.DataFrame(0.0, index=full_index, columns=prod_wells)
     lagged_wwit_diff = pd.DataFrame(0.0, index=full_index, columns=prod_wells)
     crm_rate = pd.DataFrame(0.0, index=full_index, columns=prod_wells) if use_crm else None
+    # Per-injector superposition: track top-N individual contributions
+    top_n_contributions: Dict[str, List[pd.Series]] = {prod: [] for prod in prod_wells}
     for prod in prod_wells:
         for inj, weight in weight_map.get(prod, []):
             info = pair_details.get((prod, inj))
@@ -441,13 +443,36 @@ def _build_weighted_matrices(
                 continue
             lag_value = int(info["lag"])
             lagged_rate_series = inj_rate[inj].shift(lag_value).fillna(0.0)
-            lagged_rate[prod] += weight * lagged_rate_series
+            contribution = weight * lagged_rate_series
+            lagged_rate[prod] += contribution
+            top_n_contributions[prod].append(contribution)
             lagged_diff_series = inj_wwit_diff[inj].shift(lag_value).fillna(0.0)
             lagged_wwit_diff[prod] += weight * lagged_diff_series
             if use_crm and crm_rate is not None:
                 crm_series = crm_exp_filter(inj_rate[inj], tau=float(info["tau"]), delta=1.0).fillna(0.0)
                 crm_rate[prod] += weight * crm_series
-    return lagged_rate, lagged_wwit_diff, crm_rate
+    # Build top-N individual contribution DataFrames
+    n_top = min(3, max((len(v) for v in top_n_contributions.values()), default=0))
+    top_n_frames: Dict[int, pd.DataFrame] = {}
+    for rank in range(n_top):
+        col_data = pd.DataFrame(0.0, index=full_index, columns=prod_wells)
+        for prod in prod_wells:
+            contribs = top_n_contributions[prod]
+            if rank < len(contribs):
+                col_data[prod] = contribs[rank]
+        top_n_frames[rank] = col_data
+    # Multi-scale fixed-lag injection features
+    fixed_lags = {1: "1m", 3: "3m", 6: "6m"}
+    multiscale: Dict[str, pd.DataFrame] = {}
+    for lag_val, suffix in fixed_lags.items():
+        ms_rate = pd.DataFrame(0.0, index=full_index, columns=prod_wells)
+        for prod in prod_wells:
+            for inj, weight in weight_map.get(prod, []):
+                if pair_details.get((prod, inj)) is None:
+                    continue
+                ms_rate[prod] += weight * inj_rate[inj].shift(lag_val).fillna(0.0)
+        multiscale[suffix] = ms_rate
+    return lagged_rate, lagged_wwit_diff, crm_rate, top_n_frames, multiscale
 
 
 def _ensure_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
@@ -675,7 +700,7 @@ def build_injection_lag_features(
         best_score,
         best_params,
     )
-    lagged_rate, lagged_wwit_diff, crm_rate = _build_weighted_matrices(
+    lagged_rate, lagged_wwit_diff, crm_rate, top_n_frames, multiscale = _build_weighted_matrices(
         prod_wells,
         weight_map,
         pair_details,
@@ -697,6 +722,10 @@ def build_injection_lag_features(
             frame["inj_wwir_crm_weighted"] = crm_rate[prod].to_numpy()
         else:
             frame["inj_wwir_crm_weighted"] = 0.0
+        for rank, rank_df in top_n_frames.items():
+            frame[f"inj_top{rank + 1}_contribution"] = rank_df[prod].to_numpy()
+        for suffix, ms_df in multiscale.items():
+            frame[f"inj_wwir_lag_{suffix}"] = ms_df[prod].to_numpy()
         feature_frames.append(frame)
     features = pd.concat(feature_frames, ignore_index=True)
     features = features.fillna(0.0)

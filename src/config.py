@@ -50,7 +50,7 @@ class PipelineConfig:
     enable_physics_preprocessing: bool = True
     preprocessing_structural_break_threshold: float = 0.7
     preprocessing_outlier_contamination: float = 0.05
-    preprocessing_enable_smoothing: bool = True
+    preprocessing_enable_smoothing: bool = False
     preprocessing_smooth_window_length: int = 7
     preprocessing_smooth_polyorder: int = 2
     preprocessing_bilateral_sigma_space: float = 3.0
@@ -80,6 +80,7 @@ class PipelineConfig:
         default_factory=lambda: [
             "wlpt", "womt", "womr", "wthp",
             "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted",
+            "inj_top1_contribution", "inj_top2_contribution", "inj_top3_contribution",
             "ts_embed_0", "ts_embed_1", "ts_embed_2",
             "neighbor_avg_wlpr", "neighbor_avg_womr",
             "dtw_neighbor_avg_wlpr", "dtw_neighbor_avg_womr",
@@ -89,6 +90,7 @@ class PipelineConfig:
     futr_exog: List[str] = field(
         default_factory=lambda: [
             "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted",
+            "inj_top1_contribution", "inj_top2_contribution", "inj_top3_contribution",
             "n2v_0", "n2v_1", "n2v_2", "n2v_3",
             "spectral_0", "spectral_1", "spectral_2", "spectral_3",
             "closeness_centrality",
