@@ -50,6 +50,7 @@ class PipelineConfig:
     enable_physics_preprocessing: bool = True
     preprocessing_structural_break_threshold: float = 0.7
     preprocessing_outlier_contamination: float = 0.05
+    preprocessing_enable_smoothing: bool = True
     preprocessing_smooth_window_length: int = 7
     preprocessing_smooth_polyorder: int = 2
     preprocessing_bilateral_sigma_space: float = 3.0

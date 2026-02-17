@@ -275,7 +275,7 @@ class PhysicsAwarePreprocessor:
                 differences -- automatically adapts to signal volatility.
 
         Returns:
-            DataFrame with ``{col}_smooth`` columns added.
+            DataFrame with rate columns smoothed in-place.
         """
         df = df.copy()
         hw = window_length
@@ -308,7 +308,7 @@ class PhysicsAwarePreprocessor:
                     total = w.sum()
                     smoothed[i] = (w * window).sum() / total if total > 0 else values[i]
 
-                df.loc[well_mask, f"{col}_smooth"] = smoothed
+                df.loc[well_mask, col] = smoothed
 
         return df
 
