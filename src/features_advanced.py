@@ -77,8 +77,11 @@ def create_spatial_features(
     """
     df = df.copy()
     coords_dict = coords.set_index("well")[["x", "y", "z"]].to_dict("index")
-    
-    # Add well depth features
+
+    df["coord_x"] = df["well"].map(lambda w: coords_dict.get(str(w), {}).get("x", 0.0))
+    df["coord_y"] = df["well"].map(lambda w: coords_dict.get(str(w), {}).get("y", 0.0))
+    df["coord_z"] = df["well"].map(lambda w: coords_dict.get(str(w), {}).get("z", 0.0))
+
     df["well_depth"] = df["well"].map(lambda w: abs(coords_dict.get(str(w), {}).get("z", 0)))
     
     # Compute field centroid

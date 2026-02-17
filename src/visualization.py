@@ -45,6 +45,9 @@ def generate_forecast_pdf(
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
 
+    q_lo = next((c for c in merged.columns if c.startswith("q_") and "0.1" in c), None)
+    q_hi = next((c for c in merged.columns if c.startswith("q_") and "0.9" in c), None)
+
     pdf_path = output_dir / "wlpr_forecasts.pdf"
     with PdfPages(pdf_path) as pdf:
         for unique_id, group in merged.groupby("unique_id"):
@@ -60,10 +63,19 @@ def generate_forecast_pdf(
             ax.plot(
                 group["ds"],
                 group["y_hat"],
-                label="Forecast",
+                label="Forecast (median)",
                 marker="x",
                 linewidth=1.5,
             )
+            if q_lo and q_hi and q_lo in group.columns and q_hi in group.columns:
+                ax.fill_between(
+                    group["ds"],
+                    group[q_lo],
+                    group[q_hi],
+                    alpha=0.2,
+                    color="tab:orange",
+                    label="80% CI (q10–q90)",
+                )
             ax.set_title(f"Well {unique_id} WLPR Forecast vs Actual")
             ax.set_ylabel("WLPR (m3/day)")
             ax.set_xlabel("Date")
@@ -122,7 +134,9 @@ def generate_full_history_pdf(
                 color="black",
                 linewidth=1.4,
             )
-            forecast = merged[merged["unique_id"] == unique_id]
+            forecast = merged[merged["unique_id"] == unique_id].sort_values("ds")
+            q_lo_h = next((c for c in merged.columns if c.startswith("q_") and "0.1" in c), None)
+            q_hi_h = next((c for c in merged.columns if c.startswith("q_") and "0.9" in c), None)
             if not forecast.empty:
                 ax.plot(
                     forecast["ds"],
@@ -132,6 +146,15 @@ def generate_full_history_pdf(
                     linewidth=1.5,
                     color="tab:orange",
                 )
+                if q_lo_h and q_hi_h and q_lo_h in forecast.columns and q_hi_h in forecast.columns:
+                    ax.fill_between(
+                        forecast["ds"],
+                        forecast[q_lo_h],
+                        forecast[q_hi_h],
+                        alpha=0.2,
+                        color="tab:orange",
+                        label="80% CI (q10–q90)",
+                    )
             train_start = series["ds"].min()
             test_end = series["ds"].max()
             val_start = max(train_start, test_start - val_offset)

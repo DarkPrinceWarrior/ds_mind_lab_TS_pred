@@ -10,6 +10,7 @@ import pandas as pd
 try:
     from .config import PipelineConfig
     from .features_injection import build_injection_lag_features
+    from .features_graph import build_graph_features
     from .data_validation import WellDataValidator
     from .metrics_extended import calculate_all_metrics
     from .metrics_reservoir import compute_all_reservoir_metrics
@@ -24,6 +25,7 @@ try:
 except ImportError:  # pragma: no cover
     from config import PipelineConfig
     from features_injection import build_injection_lag_features
+    from features_graph import build_graph_features
     from data_validation import WellDataValidator
     from metrics_extended import calculate_all_metrics
     from metrics_reservoir import compute_all_reservoir_metrics
@@ -394,6 +396,16 @@ def run_walk_forward_validation(
             fold_prod = create_time_series_embeddings(
                 fold_prod, feature_cols=key_features, window=12, n_components=3, train_cutoff=cutoff_date, date_col="ds",
             )
+            fold_target_wells = sorted(fold_prod["well"].unique()) if "well" in fold_prod.columns else sorted(fold_prod["unique_id"].unique())
+            fold_prod, _ = build_graph_features(
+                fold_prod, coords, fold_target_wells, fold_pair_summary if fold_pair_summary is not None else pd.DataFrame(),
+                distances=distances,
+                n2v_dimensions=config.graph_n2v_dimensions,
+                spectral_components=config.graph_spectral_components,
+                neighbor_agg_cols=config.graph_neighbor_agg_cols,
+                neighbor_k=config.graph_neighbor_k,
+                seed=config.random_seed,
+            )
             fold_prod = _fill_missing_features(fold_prod, feature_cols, context=f"Fold {split['fold']}: ")
             train_keys = fold_train_raw[["unique_id", "ds"]].drop_duplicates()
             val_keys = fold_val_raw[["unique_id", "ds"]].drop_duplicates()
@@ -534,7 +546,19 @@ def prepare_model_frames(
     prod_df = create_time_series_embeddings(
         prod_df, feature_cols=key_features, window=12, n_components=3, train_cutoff=train_cutoff, date_col="ds",
     )
-    logger.info("Advanced features created successfully")
+
+    well_types = raw_df.sort_values("date").groupby("well").tail(1).set_index("well")["type"].to_dict()
+    prod_df, _graph_static = build_graph_features(
+        prod_df, coords, target_wells, pair_summary,
+        distances=distances,
+        well_types=well_types,
+        n2v_dimensions=config.graph_n2v_dimensions,
+        spectral_components=config.graph_spectral_components,
+        neighbor_agg_cols=config.graph_neighbor_agg_cols,
+        neighbor_k=config.graph_neighbor_k,
+        seed=config.random_seed,
+    )
+    logger.info("Advanced + graph features created successfully")
 
     feature_cols = set(config.hist_exog + config.futr_exog)
     prod_df = _fill_missing_features(prod_df, feature_cols)
@@ -584,17 +608,36 @@ def _import_chronos2():
     return TimeSeries, Chronos2Model
 
 
-def _build_chronos2_model(config: PipelineConfig):
+def _build_chronos2_model(config: PipelineConfig, train_length: Optional[int] = None):
     _, Chronos2Model = _import_chronos2()
-    input_len = config.chronos_input_chunk_length or config.input_size
     output_len = config.chronos_output_chunk_length or config.horizon
+    if config.chronos_input_chunk_length:
+        input_len = config.chronos_input_chunk_length
+    else:
+        input_len = config.input_size
+    if train_length:
+        max_allowed = train_length - output_len - 1
+        input_len = min(input_len, max(max_allowed, 1))
+
+    kwargs = dict(config.chronos_kwargs) if config.chronos_kwargs else {}
+    if config.chronos_probabilistic:
+        from darts.utils.likelihood_models import QuantileRegression
+        kwargs["likelihood"] = QuantileRegression(quantiles=config.chronos_quantiles)
+        logger.info(
+            "Chronos-2 probabilistic mode: quantiles=%s", config.chronos_quantiles,
+        )
+
+    logger.info(
+        "Chronos-2 chunk sizes: input=%d, output=%d (train_length=%s)",
+        input_len, output_len, train_length,
+    )
     return Chronos2Model(
         input_chunk_length=input_len,
         output_chunk_length=output_len,
         hub_model_name=config.chronos_hub_model_name,
         hub_model_revision=config.chronos_hub_model_revision,
         local_dir=config.chronos_local_dir,
-        **(config.chronos_kwargs or {}),
+        **kwargs,
     )
 
 
@@ -665,7 +708,8 @@ def _chronos2_predict(
             futr_merged.reset_index(), time_col="ds", value_cols=list(futr_merged.columns),
         ).astype(np.float32)
 
-    model = _build_chronos2_model(config)
+    train_length = len(train_pivot)
+    model = _build_chronos2_model(config, train_length=train_length)
     fit_kwargs: Dict[str, Any] = {"series": target_ts, "verbose": False}
     predict_kwargs: Dict[str, Any] = {"n": config.horizon, "series": target_ts}
     if past_cov_ts is not None:
@@ -675,17 +719,42 @@ def _chronos2_predict(
         fit_kwargs["future_covariates"] = future_cov_ts
         predict_kwargs["future_covariates"] = future_cov_ts
 
+    if config.chronos_probabilistic:
+        predict_kwargs["predict_likelihood_parameters"] = True
+
     model.fit(**fit_kwargs)
     preds_ts = model.predict(**predict_kwargs)
 
     pred_wide = preds_ts.to_dataframe().reset_index()
     time_col = pred_wide.columns[0]
     value_cols = [c for c in pred_wide.columns if c != time_col]
+
     pred_frames: List[pd.DataFrame] = []
-    for col in value_cols:
-        frame = pred_wide[[time_col, col]].rename(columns={time_col: "ds", col: "y_hat"})
-        frame["unique_id"] = col
-        pred_frames.append(frame[["unique_id", "ds", "y_hat"]])
+    if config.chronos_probabilistic:
+        median_q = 0.5
+        q_suffix = f"_{median_q}"
+        for uid in series_ids:
+            median_col = f"{uid}{q_suffix}"
+            if median_col not in pred_wide.columns:
+                candidates = [c for c in pred_wide.columns if c.startswith(f"{uid}_")]
+                if candidates:
+                    median_col = candidates[len(candidates) // 2]
+                else:
+                    continue
+            frame = pred_wide[[time_col, median_col]].rename(
+                columns={time_col: "ds", median_col: "y_hat"},
+            )
+            frame["unique_id"] = uid
+            q_cols = [c for c in pred_wide.columns if c.startswith(f"{uid}_")]
+            for qc in q_cols:
+                q_label = qc.replace(f"{uid}_", "q_")
+                frame[q_label] = pred_wide[qc].values
+            pred_frames.append(frame)
+    else:
+        for col in value_cols:
+            frame = pred_wide[[time_col, col]].rename(columns={time_col: "ds", col: "y_hat"})
+            frame["unique_id"] = col
+            pred_frames.append(frame[["unique_id", "ds", "y_hat"]])
     return pd.concat(pred_frames, ignore_index=True)
 
 
@@ -715,8 +784,11 @@ def train_and_forecast(frames: Dict[str, pd.DataFrame], config: PipelineConfig) 
 # ---------------------------------------------------------------------------
 
 def merge_forecast_frame(pred_df: pd.DataFrame, test_df: pd.DataFrame) -> pd.DataFrame:
+    pred_cols = ["unique_id", "ds", "y_hat"] + [
+        c for c in pred_df.columns if c.startswith("q_")
+    ]
     merged = test_df[["unique_id", "ds", "y"]].merge(
-        pred_df[["unique_id", "ds", "y_hat"]], on=["unique_id", "ds"], how="inner",
+        pred_df[pred_cols], on=["unique_id", "ds"], how="inner",
     )
     if merged.empty:
         raise ValueError("No overlapping rows between predictions and test data.")

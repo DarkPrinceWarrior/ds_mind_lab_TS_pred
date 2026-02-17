@@ -52,20 +52,36 @@ class PipelineConfig:
     preprocessing_outlier_contamination: float = 0.05
     preprocessing_smooth_window_length: int = 7
     preprocessing_smooth_polyorder: int = 2
+    # Graph feature parameters
+    graph_n2v_dimensions: int = 4
+    graph_spectral_components: int = 4
+    graph_neighbor_k: int = 5
+    graph_neighbor_agg_cols: List[str] = field(
+        default_factory=lambda: ["wlpr", "womr"],
+    )
     # Feature lists
+    # NOTE: Removed type_prod/type_inj (constant per well) and time_idx
+    # (redundant with Chronos-2 positional encoding).
+    # Fourier, graph topology and CRM features retained -- they improve
+    # cross-learning for the majority of wells despite being static-per-well.
     hist_exog: List[str] = field(
         default_factory=lambda: [
-            "wlpt", "womt", "womr", "wwit", "wthp",
+            "wlpt", "womt", "womr", "wthp",
             "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted",
             "fourier_sin_1", "fourier_cos_1", "fourier_sin_2", "fourier_cos_2", "fourier_sin_3", "fourier_cos_3",
             "ts_embed_0", "ts_embed_1", "ts_embed_2",
+            "neighbor_avg_wlpr", "neighbor_avg_womr",
         ]
     )
     futr_exog: List[str] = field(
         default_factory=lambda: [
-            "month_sin", "month_cos", "time_idx", "type_prod", "type_inj",
+            "month_sin", "month_cos",
             "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted",
             "fourier_sin_1", "fourier_cos_1", "fourier_sin_2", "fourier_cos_2", "fourier_sin_3", "fourier_cos_3",
+            "n2v_0", "n2v_1", "n2v_2", "n2v_3",
+            "spectral_0", "spectral_1", "spectral_2", "spectral_3",
+            "closeness_centrality", "pagerank", "eigenvector_centrality", "clustering_coeff",
+            "crm_max_connectivity",
         ]
     )
     static_exog: List[str] = field(
@@ -81,4 +97,8 @@ class PipelineConfig:
     chronos_local_dir: Optional[str] = None
     chronos_input_chunk_length: Optional[int] = None
     chronos_output_chunk_length: Optional[int] = None
+    chronos_probabilistic: bool = True
+    chronos_quantiles: List[float] = field(
+        default_factory=lambda: [0.1, 0.5, 0.9],
+    )
     chronos_kwargs: Dict[str, Any] = field(default_factory=dict)

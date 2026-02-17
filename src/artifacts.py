@@ -32,6 +32,7 @@ try:
         generate_full_history_pdf,
         generate_residuals_pdf,
     )
+    from .visualization_features import generate_feature_analysis_pdf
 except ImportError:  # pragma: no cover
     from config import PipelineConfig
     from data_validation import validate_and_report
@@ -53,6 +54,7 @@ except ImportError:  # pragma: no cover
         generate_full_history_pdf,
         generate_residuals_pdf,
     )
+    from visualization_features import generate_feature_analysis_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -324,10 +326,12 @@ def main() -> None:
     forecast_pdf = generate_forecast_pdf(merged, metrics, output_dir)
     full_history_pdf = generate_full_history_pdf(frames, merged, metrics, config, output_dir)
     residuals_pdf = generate_residuals_pdf(merged, metrics, output_dir)
+    feature_pdf = generate_feature_analysis_pdf(frames["train_df"], output_dir)
     pdf_paths = {
         "test_forecast": str(forecast_pdf),
         "full_history": str(full_history_pdf),
         "residuals": str(residuals_pdf),
+        "feature_analysis": str(feature_pdf),
     }
 
     save_artifacts(
