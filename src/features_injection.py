@@ -700,6 +700,21 @@ def build_injection_lag_features(
         best_score,
         best_params,
     )
+    # Correlation-weighted adjustment: downweight pairs with low/negative
+    # cross-correlation to suppress spurious connections (e.g. faults).
+    for prod in prod_wells:
+        entries = weight_map.get(prod, [])
+        if not entries:
+            continue
+        adjusted = []
+        for inj, w in entries:
+            info = pair_details.get((prod, inj))
+            corr_val = max(float(info["corr"]), 0.0) if info else 0.0
+            adjusted.append((inj, w * corr_val))
+        total = sum(aw for _, aw in adjusted)
+        if total > 0:
+            adjusted = [(inj, aw / total) for inj, aw in adjusted]
+        weight_map[prod] = adjusted
     lagged_rate, lagged_wwit_diff, crm_rate, top_n_frames, multiscale = _build_weighted_matrices(
         prod_wells,
         weight_map,
