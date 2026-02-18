@@ -113,20 +113,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-path",
         type=Path,
-        default=Path("MODEL_22.09.25.csv"),
+        default=Path("MODEL_23.09.25.csv"),
         help="Path to the monthly well dataset",
-    )
-    parser.add_argument(
-        "--coords-path",
-        type=Path,
-        default=Path("coords.txt"),
-        help="Path to the well coordinates file",
     )
     parser.add_argument(
         "--distances-path",
         type=Path,
-        default=Path("well_distances.xlsx"),
-        help="Path to the well-to-well distance matrix (.xlsx)",
+        default=Path("Distance.xlsx"),
+        help="Path to combined distances + coordinates file (.xlsx)",
+    )
+    parser.add_argument(
+        "--coords-path",
+        type=Path,
+        default=None,
+        help="(legacy) Separate coordinates file. If omitted, coordinates are read from --distances-path",
     )
     parser.add_argument(
         "--output-dir",
@@ -219,8 +219,9 @@ def main() -> None:
 
     if not args.data_path.exists():
         raise FileNotFoundError(f"Dataset not found at {args.data_path}")
-    if not args.coords_path.exists():
-        raise FileNotFoundError(f"Coordinate file not found at {args.coords_path}")
+    coords_source = args.coords_path if args.coords_path else args.distances_path
+    if coords_source is None or not coords_source.exists():
+        raise FileNotFoundError(f"Coordinate/distance file not found at {coords_source}")
 
     config = PipelineConfig()
     if args.chronos_model:
@@ -265,7 +266,7 @@ def main() -> None:
 
     if not args.skip_validation:
         try:
-            coords_temp = load_coordinates(args.coords_path)
+            coords_temp = load_coordinates(coords_source)
             quality_report = validate_and_report(
                 raw_df,
                 coords=coords_temp,
@@ -282,7 +283,7 @@ def main() -> None:
         except Exception as exc:
             logger.warning("Data validation failed: %s", exc)
 
-    coords = load_coordinates(args.coords_path)
+    coords = load_coordinates(coords_source)
     distances = None
     if args.distances_path and args.distances_path.exists():
         distances = load_distance_matrix(args.distances_path)

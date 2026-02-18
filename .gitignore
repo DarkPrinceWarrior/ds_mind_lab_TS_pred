@@ -50,8 +50,8 @@ mlruns/
 lightning_logs/
 
 # Data (comment out if you want to track data)
-*.csv
-*.xlsx
+# *.csv
+# *.xlsx
 *.xls
 *.txt
 !requirements.txt

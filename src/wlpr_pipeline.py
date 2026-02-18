@@ -99,38 +99,55 @@ def load_raw_data(path: Path, validate: bool = True) -> pd.DataFrame:
 
 
 def load_coordinates(path: Path) -> pd.DataFrame:
-    records: List[Tuple[str, float, float, float]] = []
-    with open(path, "r", encoding="utf-8") as handle:
-        for raw in handle:
-            line = raw.strip()
-            if not line or line.startswith("--"):
-                continue
-            parts = line.replace("'", " ").split()
-            if len(parts) < 4:
-                continue
-            well = parts[0].strip()
-            x, y, z = map(float, parts[1:4])
-            records.append((well, x, y, z))
-    coords = pd.DataFrame(records, columns=["well", "x", "y", "z"])
-    coords["well"] = coords["well"].astype(str).str.strip()
+    """Load well coordinates from Distance.xlsx (preferred) or legacy coords.txt."""
+    suffix = path.suffix.lower()
+    if suffix in (".xlsx", ".xls"):
+        df = pd.read_excel(path, engine="openpyxl")
+        need = {"Well", "x", "y", "z"}
+        if not need.issubset(set(df.columns)):
+            raise ValueError(f"Excel coordinate file must contain columns {need}, got {list(df.columns)}")
+        coords = df[["Well", "x", "y", "z"]].copy()
+        coords.rename(columns={"Well": "well"}, inplace=True)
+        coords["well"] = coords["well"].astype(str).str.strip()
+        for c in ("x", "y", "z"):
+            coords[c] = pd.to_numeric(coords[c], errors="coerce")
+    else:
+        records: List[Tuple[str, float, float, float]] = []
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("--"):
+                    continue
+                parts = line.replace("'", " ").split()
+                if len(parts) < 4:
+                    continue
+                well = parts[0].strip()
+                x, y, z = map(float, parts[1:4])
+                records.append((well, x, y, z))
+        coords = pd.DataFrame(records, columns=["well", "x", "y", "z"])
+        coords["well"] = coords["well"].astype(str).str.strip()
     logger.info("Loaded coordinates for %d wells", len(coords))
     return coords
 
 
+def _normalize_well_label(label: object) -> str:
+    if pd.isna(label):
+        raise ValueError("Distance matrix contains unnamed wells.")
+    if isinstance(label, (int, np.integer)):
+        return str(int(label))
+    if isinstance(label, float) and float(label).is_integer():
+        return str(int(label))
+    return str(label).strip()
+
+
 def load_distance_matrix(path: Path) -> pd.DataFrame:
-    df = pd.read_excel(path, index_col=0)
-
-    def _normalize(label: object) -> str:
-        if pd.isna(label):
-            raise ValueError("Distance matrix contains unnamed wells.")
-        if isinstance(label, (int, np.integer)):
-            return str(int(label))
-        if isinstance(label, float) and float(label).is_integer():
-            return str(int(label))
-        return str(label).strip()
-
-    df.index = df.index.map(_normalize)
-    df.columns = df.columns.map(_normalize)
+    raw = pd.read_excel(path, engine="openpyxl")
+    meta_cols = {"Well", "x", "y", "z"}
+    drop_cols = [c for c in raw.columns if c in meta_cols or str(c).startswith("Unnamed")]
+    df = raw.drop(columns=drop_cols, errors="ignore")
+    df.index = raw["Well"].astype(str).str.strip() if "Well" in raw.columns else raw.index
+    df.index = df.index.map(_normalize_well_label)
+    df.columns = df.columns.map(_normalize_well_label)
     df = df.apply(pd.to_numeric, errors="coerce")
     df = df.where(pd.notnull(df), np.nan)
     df = df.sort_index().sort_index(axis=1)
