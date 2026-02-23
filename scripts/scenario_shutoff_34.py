@@ -1,10 +1,10 @@
 """
-Scenario: shut off injector well 34 from forecast start and compare with baseline.
+Scenario: shut off injector well 34 from 2021-01 and compare forecast vs baseline.
 
-Train on full factual history (identical for both scenarios).
-For the shutoff scenario, zero out well 34 WWIR only from baseline test_start
-onward in the raw data BEFORE building injection features, so the forecast
-covariates reflect loss of injection support during forecast horizon only.
+Train on full data (identical for both scenarios).
+For the shutoff scenario, zero out well 34 WWIR from 2021-01 onward in the raw
+data BEFORE building injection features, so the forecast covariates reflect
+the absence of injection support.
 """
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
 SHUTOFF_WELL = "34"
+SHUTOFF_DATE = pd.Timestamp("2021-01-01")
 
 DATA_PATH = Path("MODEL_23.09.25.csv")
 DISTANCES_PATH = Path("Distance.xlsx")
@@ -56,7 +57,6 @@ def _generate_scenario_pdf(
     merged_shut: pd.DataFrame,
     connected_prods: list,
     test_start: pd.Timestamp,
-    shutoff_date: pd.Timestamp,
     out_dir: Path,
     model_name: str,
 ):
@@ -83,7 +83,7 @@ def _generate_scenario_pdf(
         fig, ax = plt.subplots(figsize=(11, 7))
         ax.axis("off")
         ax.set_title(
-            f"Сценарий: остановка нагнетательной скв. {SHUTOFF_WELL} с {shutoff_date.strftime('%d.%m.%Y')}\n"
+            f"Сценарий: остановка нагнетательной скв. {SHUTOFF_WELL} с {SHUTOFF_DATE.strftime('%d.%m.%Y')}\n"
             f"Модель: {model_label} | Период прогноза: "
             f"{test_start.strftime('%d.%m.%Y')} \u2014 {comp['ds'].max().strftime('%d.%m.%Y')}",
             fontsize=14, fontweight="bold", pad=20,
@@ -229,19 +229,18 @@ def main():
     frames_base, preds_base, metrics_base, merged_base = run_scenario(
         raw_df, coords, config, distances, "BASELINE (all injectors active)"
     )
-    shutoff_date = pd.Timestamp(frames_base["test_start"])
 
-    # --- Shutoff: zero WWIR for well 34 from forecast start only ---
+    # --- Shutoff: zero WWIR for well 34 from 2021-01 ---
     raw_shutoff = raw_df.copy()
     mask = (
         (raw_shutoff["well"] == SHUTOFF_WELL)
-        & (raw_shutoff["date"] >= shutoff_date)
+        & (raw_shutoff["date"] >= SHUTOFF_DATE)
         & (raw_shutoff["type"] == "INJ")
     )
     n_zeroed = mask.sum()
     logger.info(
-        "Zeroing WWIR for well %s from forecast start %s: %d rows affected",
-        SHUTOFF_WELL, shutoff_date.date(), n_zeroed,
+        "Zeroing WWIR for well %s from %s: %d rows affected",
+        SHUTOFF_WELL, SHUTOFF_DATE.date(), n_zeroed,
     )
     raw_shutoff.loc[mask, "wwir"] = 0.0
     raw_shutoff.loc[mask, "wwit_diff"] = 0.0
@@ -249,7 +248,7 @@ def main():
     if n_zeroed > 0:
         pre_shutoff = raw_shutoff[
             (raw_shutoff["well"] == SHUTOFF_WELL)
-            & (raw_shutoff["date"] < shutoff_date)
+            & (raw_shutoff["date"] < SHUTOFF_DATE)
             & (raw_shutoff["type"] == "INJ")
         ]
         if not pre_shutoff.empty:
@@ -258,7 +257,7 @@ def main():
 
     frames_shut, preds_shut, metrics_shut, merged_shut = run_scenario(
         raw_shutoff, coords, config, distances,
-        f"SHUTOFF well {SHUTOFF_WELL} from forecast start {shutoff_date.date()}"
+        f"SHUTOFF well {SHUTOFF_WELL} from {SHUTOFF_DATE.date()}"
     )
 
     # --- Compare ---
@@ -320,7 +319,7 @@ def main():
     report = report.sort_values("diff_pct")
 
     print("\n" + "=" * 90)
-    print(f"СЦЕНАРИЙ: Остановка нагн. скв. {SHUTOFF_WELL} с начала прогноза ({shutoff_date.strftime('%d.%m.%Y')})")
+    print(f"СЦЕНАРИЙ: Остановка нагн. скв. {SHUTOFF_WELL} с {SHUTOFF_DATE.strftime('%d.%m.%Y')}")
     print(f"Период прогноза: {test_start.strftime('%d.%m.%Y')} — {comp['ds'].max().strftime('%d.%m.%Y')}")
     print(f"Модель: {args.model.upper()}")
     print("=" * 90)
@@ -342,7 +341,7 @@ def main():
     # --- Generate PDF report ---
     _generate_scenario_pdf(
         comp, report, frames_base, merged_base, merged_shut,
-        connected_prods, test_start, shutoff_date, out_dir, args.model,
+        connected_prods, test_start, out_dir, args.model,
     )
 
     # Save
@@ -351,8 +350,7 @@ def main():
 
     summary = {
         "model": args.model,
-        "scenario": f"Shutoff injector {SHUTOFF_WELL} from forecast start {shutoff_date.date()}",
-        "shutoff_date": str(shutoff_date.date()),
+        "scenario": f"Shutoff injector {SHUTOFF_WELL} from {SHUTOFF_DATE.date()}",
         "test_start": str(test_start.date()),
         "n_producers": len(report),
         "connected_producers": connected_prods,
