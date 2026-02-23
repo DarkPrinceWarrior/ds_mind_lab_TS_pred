@@ -34,8 +34,8 @@
 ## Быстрый старт
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 python3 -m src.artifacts \
   --data-path MODEL_23.09.25.csv \
