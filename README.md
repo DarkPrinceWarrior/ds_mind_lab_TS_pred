@@ -1,90 +1,191 @@
 # WLPR Forecasting Pipeline
 
-Прогноз дебита жидкости (WLPR) для добывающих скважин с учетом влияния нагнетательных, геометрии и физики процесса.
-Доступны два бэкенда: обучаемый TSMixerx (physics‑loss) и zero‑shot Chronos‑2.
+Прогноз месячного дебита жидкости (`WLPR`) по добывающим скважинам с учетом влияния нагнетательных, пространственных связей и графовых признаков.
+
+Поддерживаемые модели:
+- `chronos2` (Amazon Chronos-2, zero-shot через Darts)
+- `timexer` (обучаемая модель TimeXer через NeuralForecast)
+
+Текущий CLI entrypoint:
+- `python3 -m src.artifacts`
+
+## Что делает пайплайн
+
+- Загружает и валидирует промысловые данные
+- Строит лаговые признаки закачки с подбором лага и калибровкой ядра весов
+- Добавляет пространственные, временные и графовые признаки
+- Делает split train/test по горизонту прогноза
+- Считает walk-forward кросс-валидацию
+- Строит прогноз, метрики и PDF-отчеты
+- Сохраняет все артефакты в `output-dir`
+
+## Структура проекта
+
+- `src/artifacts.py` — основной CLI пайплайна (запуск, метрики, сохранение артефактов)
+- `src/wlpr_pipeline.py` — функции загрузки данных, feature engineering, inference, evaluation
+- `src/config.py` — `PipelineConfig` с параметрами моделей и признаков
+- `src/features_injection.py` — лаговые признаки закачки и CRM-фильтрация
+- `src/features_graph.py` — графовые признаки и агрегаты соседей
+- `src/visualization.py` — PDF-отчеты по прогнозу/истории/остаткам
+- `src/visualization_features.py` — PDF-анализ признаков
+- `scripts/scenario_shutoff_34.py` — сценарий “остановка нагнетательной скв. 34”
+- `PIPELINE_DOCUMENTATION.md` — расширенная техническая документация
 
 ## Быстрый старт
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-python -m src.wlpr_pipeline --data-path MODEL_22.09.25.csv --coords-path coords.txt
+python3 -m src.artifacts \
+  --data-path MODEL_23.09.25.csv \
+  --distances-path Distance.xlsx \
+  --output-dir artifacts
+```
+
+Примечание:
+- При первом запуске `chronos2` модель может скачиваться из Hugging Face.
+
+## Примеры запуска
+
+Chronos-2:
+
+```bash
+python3 -m src.artifacts \
+  --model chronos2 \
+  --data-path MODEL_23.09.25.csv \
+  --distances-path Distance.xlsx \
+  --output-dir artifacts
+```
+
+TimeXer:
+
+```bash
+python3 -m src.artifacts \
+  --model timexer \
+  --data-path MODEL_23.09.25.csv \
+  --distances-path Distance.xlsx \
+  --output-dir artifacts_timexer
+```
+
+Chronos-2 с override параметров:
+
+```bash
+python3 -m src.artifacts \
+  --model chronos2 \
+  --chronos-model amazon/chronos-2 \
+  --chronos-input-len 36 \
+  --chronos-output-len 6
 ```
 
 MLflow (опционально):
 
 ```bash
-python -m src.wlpr_pipeline --enable-mlflow --mlflow-uri http://localhost:5000
+python3 -m src.artifacts --enable-mlflow --mlflow-uri http://localhost:5000
 mlflow ui
 ```
 
-## Выбор модели
+## CLI параметры
 
-TSMixerx (по умолчанию):
+- `--data-path` путь к CSV с промысловыми данными (по умолчанию `MODEL_23.09.25.csv`)
+- `--distances-path` путь к `Distance.xlsx` (координаты + матрица расстояний)
+- `--coords-path` legacy-файл координат (если не задан, берется `--distances-path`)
+- `--output-dir` директория для артефактов (по умолчанию `artifacts`)
+- `--model` тип модели: `chronos2` или `timexer`
+- `--chronos-model` имя модели на Hugging Face для Chronos-2
+- `--chronos-revision` ревизия/тег модели Chronos-2
+- `--chronos-local-dir` локальная директория кэша Chronos-2
+- `--chronos-input-len` входное окно Chronos-2
+- `--chronos-output-len` выходное окно Chronos-2
+- `--enable-mlflow` включить трекинг MLflow
+- `--mlflow-uri` URI MLflow-сервера
+- `--disable-cache` выключить кэш промежуточных вычислений
+- `--skip-validation` пропустить валидацию данных
+- `--log-level` уровень логов: `DEBUG`, `INFO`, `WARNING`, `ERROR`
 
-```bash
-python -m src.wlpr_pipeline --model-type single
-```
+## Формат входных данных
 
-Chronos‑2 (zero‑shot):
+CSV (`;`-разделитель):
 
-```bash
-python -m src.wlpr_pipeline --model-type chronos2 --chronos-model amazon/chronos-2
-```
+- `DATA` — дата в формате `ДД.ММ.ГГГГ`
+- `well` — идентификатор скважины
+- `TYPE` — тип скважины (`PROD`/`INJ`, регистр нормализуется)
+- `WLPR` — целевая переменная (дебит жидкости)
+- Дополнительные числовые поля используются как признаки при наличии в конфиге
 
-Тюнинг Chronos‑2 (пример):
+`Distance.xlsx`:
 
-```bash
-python -m src.wlpr_pipeline --model-type chronos2 --chronos-input-len 36 --chronos-output-len 6
-```
+- Должен содержать колонки `Well`, `x`, `y`, `z`
+- Остальные колонки интерпретируются как матрица расстояний между скважинами
+- При отсутствии файла с матрицей можно передать отдельный файл координат через `--coords-path`
 
-## Входные данные
+Legacy координаты (`--coords-path`):
 
-CSV:
-- Разделитель `;`
-- Дата: колонка `DATA`, формат `дд.мм.гггг`
-- Обязательные поля: `well`, `TYPE`, `WLPR`
-- `TYPE`: `Prod` или `Inject` (регистр не важен)
-- Дополнительные числовые колонки используются как признаки, если они перечислены в `PipelineConfig`
-
-Координаты (`coords.txt`), пробельный формат, можно с заголовком:
-
-```
-WELL X Y Z
+```text
+well_id  x  y  z
 1 1234.5 5678.9 -2100.0
 ```
 
-Матрица расстояний (опционально): `well_distances.xlsx` с названиями скважин в строках и колонках.
+## Выходные артефакты
 
-## Артефакты
-- `artifacts/wlpr_predictions.csv`
-- `artifacts/metrics.json`
-- `artifacts/cv_metrics.json`
-- `artifacts/metadata.json`
-- `artifacts/wlpr_forecasts.pdf`
-- `artifacts/wlpr_full_history.pdf`
-- `artifacts/wlpr_residuals.pdf`
-- `artifacts/injection_lag_summary.csv`
-- `artifacts/data_quality_report.json`
-- `artifacts/logs/`
+Файлы в `output-dir`:
 
-## Настройки
-Основные параметры — в `PipelineConfig` (`src/wlpr_pipeline.py`).
+- `wlpr_predictions.csv` — прогнозы
+- `metrics.json` — итоговые метрики на тесте
+- `cv_metrics.json` — результаты walk-forward CV
+- `metadata.json` — конфиг, список скважин, окна train/test, пути отчетов
+- `injection_lag_summary.csv` — выбранные лаги/веса по парам producer-injector
+- `data_quality_report.json` — отчет по качеству данных (если валидация включена)
+- `wlpr_forecasts.pdf` — прогноз vs факт на тесте
+- `wlpr_full_history.pdf` — полная история с разметкой train/val/test
+- `wlpr_residuals.pdf` — остатки на тесте
+- `feature_analysis.pdf` — анализ признаков
+- `logs/` — логи запуска
+- `.cache/` — кэш промежуточных вычислений (если cache не отключен)
 
-```python
-config = PipelineConfig(
-    horizon=6,
-    model_type="chronos2",
-    loss="physics",
-    inj_top_k=5,
-)
+## Сценарный анализ
+
+Скрипт `scripts/scenario_shutoff_34.py` моделирует отключение нагнетательной скважины `34` с `2021-01-01` и сравнивает прогноз с базовым сценарием.
+
+Пример:
+
+```bash
+python3 scripts/scenario_shutoff_34.py --model timexer
 ```
 
-## Полезные флаги CLI
-- `--output-dir` путь для артефактов
-- `--disable-cache`, `--skip-validation`
-- `--log-level DEBUG|INFO|WARNING|ERROR`
-- `--chronos-model`, `--chronos-input-len`, `--chronos-output-len`
+Результаты:
 
-## Примечания
-- Chronos‑2 использует past/future covariates, но игнорирует static covariates.
-- Плановые `WWIR/WWIT` можно оставлять в `futr_exog`, если они известны заранее.
+- `artifacts_timexer/scenario_shutoff_34/` для `--model timexer`
+- `artifacts/scenario_shutoff_34/` для `--model chronos2`
+
+Внутри:
+
+- `scenario_shutoff_34.pdf`
+- `comparison_report.csv`
+- `detailed_comparison.csv`
+- `scenario_summary.json`
+
+## Использование как Python API
+
+`src/wlpr_pipeline.py` содержит функции для программного вызова.
+
+```python
+from src.config import PipelineConfig
+from src.wlpr_pipeline import (
+    load_raw_data, load_coordinates, load_distance_matrix,
+    prepare_model_frames, train_and_forecast, evaluate_predictions,
+)
+
+config = PipelineConfig(model_type="timexer")
+raw = load_raw_data("MODEL_23.09.25.csv")
+coords = load_coordinates("Distance.xlsx")
+dist = load_distance_matrix("Distance.xlsx")
+frames = prepare_model_frames(raw, coords, config, distances=dist)
+preds = train_and_forecast(frames, config)
+metrics, merged = evaluate_predictions(preds, frames["test_df"], frames["train_df"])
+```
+
+## Важно
+
+- `src/wlpr_pipeline.py` сейчас не содержит отдельного CLI `main()`: для консольного запуска используйте `src.artifacts`.
+- Расширенная поэтапная логика пайплайна описана в `PIPELINE_DOCUMENTATION.md`.
