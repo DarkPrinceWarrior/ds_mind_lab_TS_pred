@@ -454,16 +454,19 @@ def run_walk_forward_validation(
             fold_val = fold_val_raw
             fold_static_df = static_df
 
-        cov_cols = list(set(config.hist_exog + config.futr_exog))
-        available_cols = [c for c in cov_cols if c in fold_train.columns]
-        future_df = pd.concat(
-            [
-                fold_train[["unique_id", "ds"] + available_cols],
-                fold_val[["unique_id", "ds"] + [c for c in available_cols if c in fold_val.columns]],
-            ],
-            ignore_index=True,
-        ).drop_duplicates(subset=["unique_id", "ds"], keep="first").sort_values(["unique_id", "ds"])
-        preds = _chronos2_predict(fold_train, future_df, config)
+        if config.model_type == "timexer":
+            preds = _timexer_predict(fold_train, fold_val, config)
+        else:
+            cov_cols = list(set(config.hist_exog + config.futr_exog))
+            available_cols = [c for c in cov_cols if c in fold_train.columns]
+            future_df = pd.concat(
+                [
+                    fold_train[["unique_id", "ds"] + available_cols],
+                    fold_val[["unique_id", "ds"] + [c for c in available_cols if c in fold_val.columns]],
+                ],
+                ignore_index=True,
+            ).drop_duplicates(subset=["unique_id", "ds"], keep="first").sort_values(["unique_id", "ds"])
+            preds = _chronos2_predict(fold_train, future_df, config)
 
         metrics, merged = evaluate_predictions(preds, fold_val, fold_train)
         overall_raw = metrics.get("overall", {})
@@ -836,12 +839,105 @@ def _chronos2_predict(
 
 
 # ---------------------------------------------------------------------------
+# TimeXer model
+# ---------------------------------------------------------------------------
+
+def _timexer_predict(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    config: PipelineConfig,
+) -> pd.DataFrame:
+    from neuralforecast import NeuralForecast
+    from neuralforecast.models import TimeXer
+    from neuralforecast.losses.pytorch import MAE, MSE, HuberLoss
+
+    loss_map = {"mse": MSE(), "mae": MAE(), "huber": HuberLoss()}
+    loss_fn = loss_map.get(config.timexer_loss, MSE())
+
+    futr_cols = [c for c in config.futr_exog if c in train_df.columns]
+    hist_cols = [c for c in config.hist_exog if c in train_df.columns and c not in futr_cols]
+    stat_cols = [c for c in config.static_exog if c in train_df.columns]
+
+    n_series = train_df["unique_id"].nunique()
+
+    model = TimeXer(
+        h=config.horizon,
+        input_size=config.input_size,
+        n_series=n_series,
+        futr_exog_list=futr_cols if futr_cols else None,
+        hist_exog_list=hist_cols if hist_cols else None,
+        stat_exog_list=stat_cols if stat_cols else None,
+        patch_len=config.timexer_patch_len,
+        hidden_size=config.timexer_hidden_size,
+        n_heads=config.timexer_n_heads,
+        e_layers=config.timexer_e_layers,
+        d_ff=config.timexer_d_ff,
+        dropout=config.timexer_dropout,
+        loss=loss_fn,
+        valid_loss=MAE(),
+        max_steps=config.timexer_max_steps,
+        learning_rate=config.timexer_learning_rate,
+        batch_size=config.timexer_batch_size,
+        early_stop_patience_steps=config.timexer_early_stop_patience,
+        val_check_steps=config.timexer_val_check_steps,
+        scaler_type=config.timexer_scaler_type,
+        random_seed=config.random_seed,
+        accelerator="auto",
+        enable_progress_bar=True,
+    )
+
+    nf = NeuralForecast(models=[model], freq=config.freq)
+
+    nf_train = train_df[["unique_id", "ds", "y"] + futr_cols + hist_cols + stat_cols].copy()
+    nf_train = nf_train.fillna(0.0)
+
+    static_df = None
+    if stat_cols:
+        static_df = nf_train.groupby("unique_id")[["unique_id"] + stat_cols].first().reset_index(drop=True)
+        nf_train = nf_train.drop(columns=stat_cols, errors="ignore")
+
+    logger.info(
+        "TimeXer config: input=%d, h=%d, n_series=%d, patch=%d, hidden=%d, "
+        "heads=%d, layers=%d, futr=%d cols, hist=%d cols, stat=%d cols",
+        config.input_size, config.horizon, n_series,
+        config.timexer_patch_len, config.timexer_hidden_size,
+        config.timexer_n_heads, config.timexer_e_layers,
+        len(futr_cols), len(hist_cols), len(stat_cols),
+    )
+
+    nf.fit(df=nf_train, static_df=static_df, val_size=config.val_horizon)
+
+    futr_df = None
+    if futr_cols:
+        futr_df = test_df[["unique_id", "ds"] + futr_cols].copy().fillna(0.0)
+
+    forecasts = nf.predict(futr_df=futr_df, static_df=static_df)
+    forecasts = forecasts.reset_index()
+
+    timexer_col = [c for c in forecasts.columns if c.startswith("TimeXer")]
+    if timexer_col:
+        forecasts = forecasts.rename(columns={timexer_col[0]: "y_hat"})
+    elif "y_hat" not in forecasts.columns:
+        val_cols = [c for c in forecasts.columns if c not in {"unique_id", "ds"}]
+        if val_cols:
+            forecasts = forecasts.rename(columns={val_cols[0]: "y_hat"})
+
+    return forecasts[["unique_id", "ds", "y_hat"]]
+
+
+# ---------------------------------------------------------------------------
 # Training & forecasting
 # ---------------------------------------------------------------------------
 
 def train_and_forecast(frames: Dict[str, pd.DataFrame], config: PipelineConfig) -> pd.DataFrame:
     train_df = frames["train_df"]
     test_df = frames["test_df"]
+
+    if config.model_type == "timexer":
+        preds = _timexer_predict(train_df, test_df, config)
+        logger.info("Generated %d TimeXer forecast rows", len(preds))
+        return preds
+
     cov_cols = list(set(config.hist_exog + config.futr_exog))
     available_cols = [c for c in cov_cols if c in train_df.columns]
     future_df = pd.concat(

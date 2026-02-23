@@ -115,3 +115,19 @@ class PipelineConfig:
         default_factory=lambda: [0.1, 0.5, 0.9],
     )
     chronos_kwargs: Dict[str, Any] = field(default_factory=dict)
+    # Model selection
+    model_type: str = "chronos2"  # "chronos2" or "timexer"
+    # TimeXer configuration
+    timexer_patch_len: int = 6
+    timexer_hidden_size: int = 128
+    timexer_n_heads: int = 8
+    timexer_e_layers: int = 2
+    timexer_d_ff: int = 256
+    timexer_dropout: float = 0.1
+    timexer_max_steps: int = 500
+    timexer_learning_rate: float = 1e-3
+    timexer_batch_size: int = 32
+    timexer_early_stop_patience: int = 5
+    timexer_val_check_steps: int = 50
+    timexer_scaler_type: str = "standard"
+    timexer_loss: str = "mse"  # "mse", "mae", "huber"

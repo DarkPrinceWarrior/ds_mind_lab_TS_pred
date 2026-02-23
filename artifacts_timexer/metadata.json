@@ -1,0 +1,277 @@
+{
+  "config": {
+    "horizon": 6,
+    "val_horizon": 6,
+    "freq": "MS",
+    "min_history": 60,
+    "input_size": 48,
+    "random_seed": 42,
+    "cv_folds": 6,
+    "cv_step": 6,
+    "cv_enabled": true,
+    "physics_weight": 0.1,
+    "physics_injection_coeff": 0.05,
+    "physics_damping": 0.01,
+    "physics_smoothing_weight": 0.0,
+    "physics_features": [
+      "inj_wwir_lag_weighted"
+    ],
+    "physics_base_loss": "huber",
+    "inj_top_k": 5,
+    "inj_kernel_type": "idw",
+    "inj_kernel_p": 2.0,
+    "inj_kernel_params": {},
+    "inj_kernel_calibrate": true,
+    "inj_kernel_param_grid": {},
+    "inj_kernel_candidates": [
+      {
+        "type": "idw",
+        "calibrate": true,
+        "params": {
+          "p": 1.5
+        },
+        "param_grid": {
+          "p": [
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0
+          ]
+        }
+      },
+      {
+        "type": "exponential",
+        "calibrate": true,
+        "params": {
+          "scale": 400.0
+        },
+        "param_grid": {
+          "scale": [
+            200.0,
+            400.0,
+            600.0,
+            800.0,
+            1000.0
+          ]
+        }
+      },
+      {
+        "type": "gaussian",
+        "calibrate": true,
+        "params": {
+          "scale": 400.0
+        },
+        "param_grid": {
+          "scale": [
+            200.0,
+            400.0,
+            600.0,
+            800.0,
+            1000.0
+          ]
+        }
+      },
+      {
+        "type": "matern",
+        "calibrate": true,
+        "params": {
+          "scale": 400.0,
+          "nu": 1.5
+        },
+        "param_grid": {
+          "scale": [
+            200.0,
+            400.0,
+            600.0,
+            800.0
+          ],
+          "nu": [
+            0.5,
+            1.5,
+            2.5
+          ]
+        }
+      },
+      {
+        "type": "rational_quadratic",
+        "calibrate": true,
+        "params": {
+          "scale": 400.0,
+          "alpha": 1.0
+        },
+        "param_grid": {
+          "scale": [
+            200.0,
+            400.0,
+            600.0,
+            800.0
+          ],
+          "alpha": [
+            0.5,
+            1.0,
+            2.0
+          ]
+        }
+      }
+    ],
+    "inj_distance_anisotropy": null,
+    "inj_directional_bias": null,
+    "use_crm_filter": true,
+    "tau_bound_multiplier": 2.0,
+    "lag_min_overlap": 6,
+    "physics_estimates": null,
+    "enable_physics_preprocessing": true,
+    "preprocessing_structural_break_threshold": 0.7,
+    "preprocessing_outlier_contamination": 0.05,
+    "preprocessing_enable_smoothing": false,
+    "preprocessing_smooth_window_length": 7,
+    "preprocessing_smooth_polyorder": 2,
+    "preprocessing_bilateral_sigma_space": 3.0,
+    "graph_n2v_dimensions": 4,
+    "graph_spectral_components": 4,
+    "graph_neighbor_k": 5,
+    "graph_neighbor_agg_cols": [
+      "wlpr",
+      "womr"
+    ],
+    "graph_dtw_agg_cols": [
+      "wlpr",
+      "womr"
+    ],
+    "graph_dtw_k": 5,
+    "graph_sparsify": true,
+    "graph_sparsify_max_k": 4,
+    "graph_sparsify_inter_quantile": 0.5,
+    "hist_exog": [
+      "wlpt",
+      "womt",
+      "womr",
+      "wthp",
+      "inj_wwir_lag_weighted",
+      "inj_wwit_diff_lag_weighted",
+      "inj_wwir_crm_weighted",
+      "inj_top1_contribution",
+      "inj_top2_contribution",
+      "inj_top3_contribution",
+      "ts_embed_0",
+      "ts_embed_1",
+      "ts_embed_2",
+      "neighbor_avg_wlpr",
+      "neighbor_avg_womr",
+      "dtw_neighbor_avg_wlpr",
+      "dtw_neighbor_avg_womr",
+      "productivity_index",
+      "dp_drawdown"
+    ],
+    "futr_exog": [
+      "inj_wwir_lag_weighted",
+      "inj_wwit_diff_lag_weighted",
+      "inj_wwir_crm_weighted",
+      "inj_top1_contribution",
+      "inj_top2_contribution",
+      "inj_top3_contribution",
+      "n2v_0",
+      "n2v_1",
+      "n2v_2",
+      "n2v_3",
+      "spectral_0",
+      "spectral_1",
+      "spectral_2",
+      "spectral_3",
+      "closeness_centrality",
+      "crm_max_connectivity"
+    ],
+    "static_exog": [
+      "coord_x",
+      "coord_y",
+      "coord_z",
+      "well_depth",
+      "dist_from_center",
+      "quadrant_0",
+      "quadrant_1",
+      "quadrant_2",
+      "quadrant_3"
+    ],
+    "chronos_hub_model_name": "amazon/chronos-2",
+    "chronos_hub_model_revision": null,
+    "chronos_local_dir": null,
+    "chronos_input_chunk_length": null,
+    "chronos_output_chunk_length": null,
+    "chronos_probabilistic": true,
+    "chronos_quantiles": [
+      0.1,
+      0.5,
+      0.9
+    ],
+    "chronos_kwargs": {},
+    "model_type": "timexer",
+    "timexer_patch_len": 6,
+    "timexer_hidden_size": 128,
+    "timexer_n_heads": 8,
+    "timexer_e_layers": 2,
+    "timexer_d_ff": 256,
+    "timexer_dropout": 0.1,
+    "timexer_max_steps": 500,
+    "timexer_learning_rate": 0.001,
+    "timexer_batch_size": 32,
+    "timexer_early_stop_patience": 5,
+    "timexer_val_check_steps": 50,
+    "timexer_scaler_type": "standard",
+    "timexer_loss": "mse"
+  },
+  "target_wells": [
+    "14",
+    "22",
+    "23",
+    "27",
+    "3",
+    "31",
+    "33",
+    "35",
+    "38",
+    "40",
+    "45",
+    "48",
+    "50"
+  ],
+  "test_start": "2022-06-01",
+  "train_cutoff": "2022-05-01",
+  "train_rows": 2353,
+  "test_rows": 78,
+  "kernel_selection": {
+    "kernel_type": "idw",
+    "kernel_params": {
+      "p": 4.0
+    },
+    "kernel_score": 10.449543656138275
+  },
+  "injection_summary_path": "artifacts_timexer/injection_lag_summary.csv",
+  "injection_pairs": 65,
+  "pdf_reports": {
+    "test_forecast": "artifacts_timexer/wlpr_forecasts.pdf",
+    "full_history": "artifacts_timexer/wlpr_full_history.pdf",
+    "residuals": "artifacts_timexer/wlpr_residuals.pdf",
+    "feature_analysis": "artifacts_timexer/feature_analysis.pdf"
+  },
+  "walk_forward_cv": {
+    "folds": 6,
+    "aggregate": {
+      "mae": 5.573286867201331,
+      "rmse": 9.972574416515267,
+      "mape": 4.307392896538404,
+      "smape": 4.316197804630837,
+      "wmape": 3.6452119891115955,
+      "mase": 1.2367482542468466,
+      "r2": 0.9929566829135682,
+      "nse": 0.9929566829135682,
+      "kge": 0.9750401418612082,
+      "pbias": 0.5154223750451918,
+      "index_of_agreement": 0.9981902442469565,
+      "mean_bias_error": -0.7885208890267206,
+      "correlation": 0.9971914643305267
+    },
+    "details_path": "artifacts_timexer/cv_metrics.json"
+  }
+}

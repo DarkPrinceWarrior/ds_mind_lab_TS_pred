@@ -192,6 +192,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Chronos-2 output chunk length (defaults to horizon)",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="chronos2",
+        choices=["chronos2", "timexer"],
+        help="Forecasting model to use (default: chronos2)",
+    )
     return parser.parse_args()
 
 
@@ -213,7 +220,7 @@ def main() -> None:
 
     start_time = time.perf_counter()
     logger.info("=" * 80)
-    logger.info("Starting WLPR Forecasting Pipeline (Chronos-2)")
+    logger.info("Starting WLPR Forecasting Pipeline (%s)", args.model.upper())
     logger.info("Timestamp: %s", datetime.now().isoformat())
     logger.info("=" * 80)
 
@@ -224,6 +231,7 @@ def main() -> None:
         raise FileNotFoundError(f"Coordinate/distance file not found at {coords_source}")
 
     config = PipelineConfig()
+    config.model_type = args.model
     if args.chronos_model:
         config.chronos_hub_model_name = args.chronos_model
     if args.chronos_revision:
