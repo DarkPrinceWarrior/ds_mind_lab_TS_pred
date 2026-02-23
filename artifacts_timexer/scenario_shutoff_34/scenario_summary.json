@@ -1,6 +1,7 @@
 {
   "model": "timexer",
-  "scenario": "Shutoff injector 34 from 2021-01-01",
+  "scenario": "Shutoff injector 34 from forecast start 2022-06-01",
+  "shutoff_date": "2022-06-01",
   "test_start": "2022-06-01",
   "n_producers": 13,
   "connected_producers": [
@@ -18,20 +19,20 @@
     "48",
     "50"
   ],
-  "baseline_wmape": 1.6753380525823085,
-  "shutoff_wmape": 1.5432864564501507,
+  "baseline_wmape": 2.059142934028658,
+  "shutoff_wmape": 2.1958561414372024,
   "most_affected_wells": [
     {
-      "well": "14",
-      "diff_pct": -0.47
+      "well": "40",
+      "diff_pct": -0.14
     },
     {
-      "well": "38",
-      "diff_pct": -0.04
+      "well": "48",
+      "diff_pct": -0.12
     },
     {
-      "well": "22",
-      "diff_pct": -0.03
+      "well": "31",
+      "diff_pct": -0.07
     }
   ]
 }
