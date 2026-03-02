@@ -16,6 +16,7 @@
 - Добавляет пространственные, временные и графовые признаки
 - Делает split train/test по горизонту прогноза
 - Считает walk-forward кросс-валидацию
+- Калибрует prediction intervals через Conformal (ICP/WCP) на out-of-sample residuals из CV
 - Строит прогноз, метрики и PDF-отчеты
 - Сохраняет все артефакты в `output-dir`
 
@@ -68,6 +69,19 @@ python3 -m src.artifacts \
   --output-dir artifacts_timexer
 ```
 
+TimeXer + Conformal (WCP, 90% PI):
+
+```bash
+export CUDA_VISIBLE_DEVICES=''  # опционально: форс CPU
+python3 -m src.artifacts \
+  --model timexer \
+  --data-path MODEL_23.09.25.csv \
+  --distances-path Distance.xlsx \
+  --output-dir artifacts_timexer \
+  --conformal-method wcp_exp \
+  --conformal-alpha 0.1
+```
+
 Chronos-2 с override параметров:
 
 ```bash
@@ -102,6 +116,49 @@ mlflow ui
 - `--disable-cache` выключить кэш промежуточных вычислений
 - `--skip-validation` пропустить валидацию данных
 - `--log-level` уровень логов: `DEBUG`, `INFO`, `WARNING`, `ERROR`
+- `--disable-conformal` отключить conformal-интервалы
+- `--conformal-alpha` miscoverage `alpha` (например `0.1` => целевое покрытие 90%)
+- `--conformal-method` метод калибровки: `icp`, `wcp_exp`, `wcp_linear`
+- `--conformal-exp-decay` коэффициент затухания для `wcp_exp` (ближе к `1.0` => медленнее забывание)
+- `--conformal-min-samples` минимум residuals на шаг горизонта для отдельной калибровки
+- `--conformal-global` использовать один глобальный `eps` для всех шагов горизонта
+
+## Conformal интервалы: что это и зачем
+
+Conformal в этом проекте — это пост-процессинг поверх точечного прогноза `y_hat`, который строит интервалы неопределенности `cp_lo`/`cp_hi` с целевым покрытием (например 90%) на основе реальных out-of-sample ошибок.
+
+Зачем:
+- Квантильные интервалы модели (`q_0.1/q_0.9`) не гарантируют нужное покрытие на промысловых сдвигах режима.
+- Conformal калибрует ширину интервала по фактическим ошибкам и обычно лучше переносится на production.
+- Для нестационарности можно использовать `WCP` (`wcp_exp`/`wcp_linear`), где последние residuals важнее старых.
+
+Как встроено в пайплайн:
+- Ошибки для калибровки берутся из walk-forward CV (out-of-sample residual pool).
+- По каждому шагу горизонта (`h=1..H`) считается свой `eps[h]` (или global fallback).
+- На тесте интервал строится как:
+  - `cp_lo = y_hat - eps[h]`
+  - `cp_hi = y_hat + eps[h]`
+
+Если `cv_enabled=False`, residual pool не формируется, и conformal-калибровка не применяется.
+
+## Как интерпретировать Conformal в отчетах
+
+В `wlpr_predictions.csv`:
+- `cp_lo`, `cp_hi` — conformal границы интервала для точки прогноза.
+- `cp_eps` — радиус интервала.
+- `cp_method`, `cp_alpha` — параметры калибровки.
+
+В `metrics.json` (раздел `reservoir`):
+- `reliability_picp` — фактическая доля точек, попавших в интервал.
+  - Сравнивай с целевым уровнем `1 - alpha` (например, 0.9).
+  - `PICP < target`: интервалы слишком узкие (недопокрытие).
+  - `PICP >> target`: интервалы слишком широкие (избыточный запас).
+- `reliability_mpiw` — средняя ширина интервала (меньше — резче, но не в ущерб покрытию).
+- `reliability_interval_sharpness` — нормированная ширина интервала.
+
+Практическое правило:
+- Сначала добивайся близкого к целевому `PICP`, затем оптимизируй `MPIW`.
+- При частых режимных сдвигах предпочитай `wcp_exp` и подбирай `conformal_exp_decay`.
 
 ## Формат входных данных
 
@@ -132,7 +189,7 @@ well_id  x  y  z
 
 - `wlpr_predictions.csv` — прогнозы
 - `metrics.json` — итоговые метрики на тесте
-- `cv_metrics.json` — результаты walk-forward CV
+- `cv_metrics.json` — результаты walk-forward CV (включая `conformal_profile`, если калибровка выполнена)
 - `metadata.json` — конфиг, список скважин, окна train/test, пути отчетов
 - `injection_lag_summary.csv` — выбранные лаги/веса по парам producer-injector
 - `data_quality_report.json` — отчет по качеству данных (если валидация включена)
