@@ -35,6 +35,50 @@ def _format_metrics_text(metrics: Dict[str, Dict[str, Dict[str, float]]], unique
     )
 
 
+def _parse_quantile_column(column: str) -> Optional[float]:
+    if not column.startswith("q_"):
+        return None
+    try:
+        return float(column.split("q_", 1)[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_interval_for_plot(df: pd.DataFrame) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    if {"cp_lo", "cp_hi"}.issubset(df.columns):
+        alpha_val = None
+        if "cp_alpha" in df.columns:
+            alpha_series = pd.to_numeric(df["cp_alpha"], errors="coerce").dropna()
+            if not alpha_series.empty:
+                alpha_val = float(alpha_series.median())
+        if alpha_val is not None:
+            coverage = int(round((1.0 - alpha_val) * 100.0))
+            return "cp_lo", "cp_hi", f"Conformal PI ({coverage}%)"
+        return "cp_lo", "cp_hi", "Conformal PI"
+
+    quantile_map: Dict[float, str] = {}
+    for col in df.columns:
+        q = _parse_quantile_column(col)
+        if q is not None:
+            quantile_map[q] = col
+    if not quantile_map:
+        return None, None, None
+
+    lower_candidates = sorted([q for q in quantile_map if q < 0.5])
+    upper_candidates = sorted([q for q in quantile_map if q > 0.5])
+    if not lower_candidates or not upper_candidates:
+        return None, None, None
+
+    lower_q = lower_candidates[-1]
+    upper_q = upper_candidates[0]
+    interval_pct = int(round((upper_q - lower_q) * 100.0))
+    return (
+        quantile_map[lower_q],
+        quantile_map[upper_q],
+        f"{interval_pct}% CI (q{int(lower_q * 100)}–q{int(upper_q * 100)})",
+    )
+
+
 def generate_forecast_pdf(
     merged: pd.DataFrame, metrics: Dict[str, Dict[str, float]], output_dir: Path
 ) -> Path:
@@ -45,8 +89,7 @@ def generate_forecast_pdf(
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
 
-    q_lo = next((c for c in merged.columns if c.startswith("q_") and "0.1" in c), None)
-    q_hi = next((c for c in merged.columns if c.startswith("q_") and "0.9" in c), None)
+    interval_lo, interval_hi, interval_label = _resolve_interval_for_plot(merged)
 
     pdf_path = output_dir / "wlpr_forecasts.pdf"
     with PdfPages(pdf_path) as pdf:
@@ -67,14 +110,14 @@ def generate_forecast_pdf(
                 marker="x",
                 linewidth=1.5,
             )
-            if q_lo and q_hi and q_lo in group.columns and q_hi in group.columns:
+            if interval_lo and interval_hi and interval_lo in group.columns and interval_hi in group.columns:
                 ax.fill_between(
                     group["ds"],
-                    group[q_lo],
-                    group[q_hi],
+                    group[interval_lo],
+                    group[interval_hi],
                     alpha=0.2,
                     color="tab:orange",
-                    label="80% CI (q10–q90)",
+                    label=interval_label or "Prediction Interval",
                 )
             ax.set_title(f"Well {unique_id} WLPR Forecast vs Actual")
             ax.set_ylabel("WLPR (m3/day)")
@@ -120,6 +163,7 @@ def generate_full_history_pdf(
     )
     test_start = pd.Timestamp(frames["test_start"])
     val_offset = pd.DateOffset(months=config.val_horizon)
+    interval_lo, interval_hi, interval_label = _resolve_interval_for_plot(merged)
     pdf_path = output_dir / "wlpr_full_history.pdf"
     with PdfPages(pdf_path) as pdf:
         for unique_id in frames["target_wells"]:
@@ -135,8 +179,6 @@ def generate_full_history_pdf(
                 linewidth=1.4,
             )
             forecast = merged[merged["unique_id"] == unique_id].sort_values("ds")
-            q_lo_h = next((c for c in merged.columns if c.startswith("q_") and "0.1" in c), None)
-            q_hi_h = next((c for c in merged.columns if c.startswith("q_") and "0.9" in c), None)
             if not forecast.empty:
                 ax.plot(
                     forecast["ds"],
@@ -146,14 +188,14 @@ def generate_full_history_pdf(
                     linewidth=1.5,
                     color="tab:orange",
                 )
-                if q_lo_h and q_hi_h and q_lo_h in forecast.columns and q_hi_h in forecast.columns:
+                if interval_lo and interval_hi and interval_lo in forecast.columns and interval_hi in forecast.columns:
                     ax.fill_between(
                         forecast["ds"],
-                        forecast[q_lo_h],
-                        forecast[q_hi_h],
+                        forecast[interval_lo],
+                        forecast[interval_hi],
                         alpha=0.2,
                         color="tab:orange",
-                        label="80% CI (q10–q90)",
+                        label=interval_label or "Prediction Interval",
                     )
             train_start = series["ds"].min()
             test_end = series["ds"].max()

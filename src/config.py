@@ -25,6 +25,13 @@ class PipelineConfig:
     cv_folds: int = 6
     cv_step: int = 6
     cv_enabled: bool = True
+    # Conformal prediction (post-processing UQ)
+    conformal_enabled: bool = True
+    conformal_alpha: float = 0.1
+    conformal_method: str = "wcp_exp"  # "icp", "wcp_exp", "wcp_linear"
+    conformal_per_horizon: bool = True
+    conformal_exp_decay: float = 0.97
+    conformal_min_samples: int = 30
     # Physics parameters
     physics_weight: float = 0.1
     physics_injection_coeff: float = 0.05

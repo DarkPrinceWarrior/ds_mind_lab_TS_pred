@@ -9,6 +9,7 @@ import pandas as pd
 
 try:
     from .config import PipelineConfig
+    from .conformal import compute_conformal_profile
     from .features_injection import build_injection_lag_features
     from .features_graph import build_graph_features
     from .data_validation import WellDataValidator
@@ -24,6 +25,7 @@ try:
     )
 except ImportError:  # pragma: no cover
     from config import PipelineConfig
+    from conformal import compute_conformal_profile
     from features_injection import build_injection_lag_features
     from features_graph import build_graph_features
     from data_validation import WellDataValidator
@@ -382,6 +384,7 @@ def run_walk_forward_validation(
         return None
 
     fold_results: List[Dict[str, object]] = []
+    residual_pool_frames: List[pd.DataFrame] = []
     metric_sums: Dict[str, float] = {}
     metric_weights: Dict[str, float] = {}
     feature_cols = set(config.hist_exog + config.futr_exog)
@@ -502,14 +505,61 @@ def run_walk_forward_validation(
             metric_sums[key] = metric_sums.get(key, 0.0) + value * rows
             metric_weights[key] = metric_weights.get(key, 0.0) + rows
 
+        fold_residuals = merged[["unique_id", "ds", "y", "y_hat"]].copy()
+        if "time_idx" in merged.columns:
+            fold_residuals["h_step"] = pd.to_numeric(merged["time_idx"], errors="coerce") - int(split["val_start"]) + 1
+        else:
+            fold_residuals["h_step"] = fold_residuals.groupby("unique_id").cumcount() + 1
+        fold_residuals["h_step"] = pd.to_numeric(fold_residuals["h_step"], errors="coerce")
+        fold_residuals = fold_residuals[fold_residuals["h_step"].notna()].copy()
+        fold_residuals["h_step"] = fold_residuals["h_step"].astype(int)
+        fold_residuals = fold_residuals[
+            (fold_residuals["h_step"] >= 1) & (fold_residuals["h_step"] <= int(config.horizon))
+        ].copy()
+        if not fold_residuals.empty:
+            fold_residuals["abs_err"] = (fold_residuals["y"] - fold_residuals["y_hat"]).abs()
+            fold_residuals["fold"] = int(split["fold"])
+            residual_pool_frames.append(
+                fold_residuals[["fold", "unique_id", "ds", "h_step", "abs_err"]].sort_values(["ds", "unique_id"])
+            )
+
     aggregate = {
         key: float(metric_sums[key] / metric_weights[key])
         for key in metric_sums
         if metric_weights.get(key, 0.0) > 0.0
     }
+
+    conformal_profile: Optional[Dict[str, object]] = None
+    if config.conformal_enabled:
+        if residual_pool_frames:
+            residual_pool = pd.concat(residual_pool_frames, ignore_index=True)
+            residual_pool = residual_pool.sort_values(["ds", "fold", "unique_id"]).reset_index(drop=True)
+            residual_pool["calib_order"] = np.arange(len(residual_pool))
+            conformal_profile = compute_conformal_profile(
+                residual_pool,
+                horizon=config.horizon,
+                alpha=config.conformal_alpha,
+                method=config.conformal_method,
+                per_horizon=config.conformal_per_horizon,
+                exp_decay=config.conformal_exp_decay,
+                min_samples=config.conformal_min_samples,
+            )
+            if conformal_profile:
+                logger.info(
+                    "Conformal calibrated from CV residuals: method=%s, alpha=%.3f, samples=%d",
+                    conformal_profile.get("method"),
+                    float(conformal_profile.get("alpha", config.conformal_alpha)),
+                    int(conformal_profile.get("global_samples", 0)),
+                )
+        else:
+            logger.warning("Conformal enabled, but CV produced no residual pool.")
+
     if aggregate:
         logger.info("Walk-forward validation aggregate metrics: %s", {k: round(v, 4) for k, v in aggregate.items()})
-    return {"folds": fold_results, "aggregate": aggregate}
+    result: Dict[str, object] = {"folds": fold_results, "aggregate": aggregate}
+    if conformal_profile:
+        result["conformal_profile"] = conformal_profile
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -958,11 +1008,55 @@ def train_and_forecast(frames: Dict[str, pd.DataFrame], config: PipelineConfig) 
 # Evaluation
 # ---------------------------------------------------------------------------
 
+def _parse_quantile_column(column: str) -> Optional[float]:
+    if not column.startswith("q_"):
+        return None
+    try:
+        return float(column.split("q_", 1)[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _select_interval_columns(
+    merged: pd.DataFrame,
+) -> Tuple[Optional[str], Optional[str], float, Optional[str]]:
+    if {"cp_lo", "cp_hi"}.issubset(merged.columns):
+        confidence_level = 0.9
+        if "cp_alpha" in merged.columns:
+            alpha_vals = pd.to_numeric(merged["cp_alpha"], errors="coerce").dropna()
+            if not alpha_vals.empty:
+                confidence_level = 1.0 - float(alpha_vals.median())
+        confidence_level = float(np.clip(confidence_level, 0.0, 1.0))
+        return "cp_lo", "cp_hi", confidence_level, "conformal"
+
+    quantile_map: Dict[float, str] = {}
+    for col in merged.columns:
+        q = _parse_quantile_column(col)
+        if q is not None:
+            quantile_map[q] = col
+    if not quantile_map:
+        return None, None, 0.9, None
+
+    lower_candidates = sorted([q for q in quantile_map if q < 0.5])
+    upper_candidates = sorted([q for q in quantile_map if q > 0.5])
+    if not lower_candidates or not upper_candidates:
+        return None, None, 0.9, None
+
+    lower_q = lower_candidates[-1]
+    upper_q = upper_candidates[0]
+    confidence_level = float(np.clip(upper_q - lower_q, 0.0, 1.0))
+    return quantile_map[lower_q], quantile_map[upper_q], confidence_level, "quantile"
+
+
 def merge_forecast_frame(pred_df: pd.DataFrame, test_df: pd.DataFrame) -> pd.DataFrame:
     pred_cols = ["unique_id", "ds", "y_hat"] + [
-        c for c in pred_df.columns if c.startswith("q_")
+        c for c in pred_df.columns if c.startswith("q_") or c.startswith("cp_")
     ]
-    merged = test_df[["unique_id", "ds", "y"]].merge(
+    pred_cols = list(dict.fromkeys(pred_cols))
+    test_cols = ["unique_id", "ds", "y"]
+    if "time_idx" in test_df.columns:
+        test_cols.append("time_idx")
+    merged = test_df[test_cols].merge(
         pred_df[pred_cols], on=["unique_id", "ds"], how="inner",
     )
     if merged.empty:
@@ -978,6 +1072,7 @@ def evaluate_predictions(
     use_extended_metrics: bool = True,
 ) -> Tuple[Dict[str, Dict[str, float]], pd.DataFrame]:
     merged = merge_forecast_frame(pred_df, test_df)
+    interval_lo_col, interval_hi_col, confidence_level, interval_source = _select_interval_columns(merged)
 
     overall = calculate_all_metrics(
         merged["y"].to_numpy(),
@@ -994,9 +1089,28 @@ def evaluate_predictions(
 
     reservoir_metrics = {}
     try:
-        time_idx = merged.groupby("unique_id").cumcount().to_numpy()
+        time_idx = (
+            pd.to_numeric(merged["time_idx"], errors="coerce").to_numpy()
+            if "time_idx" in merged.columns
+            else merged.groupby("unique_id").cumcount().to_numpy()
+        )
+        y_pred_lower = merged[interval_lo_col].to_numpy() if interval_lo_col is not None else None
+        y_pred_upper = merged[interval_hi_col].to_numpy() if interval_hi_col is not None else None
+        if interval_lo_col and interval_hi_col:
+            logger.info(
+                "Interval metrics source: %s (%s, %s), target coverage %.1f%%",
+                interval_source,
+                interval_lo_col,
+                interval_hi_col,
+                confidence_level * 100.0,
+            )
         reservoir_metrics = compute_all_reservoir_metrics(
-            y_true=merged["y"].to_numpy(), y_pred=merged["y_hat"].to_numpy(), time_idx=time_idx,
+            y_true=merged["y"].to_numpy(),
+            y_pred=merged["y_hat"].to_numpy(),
+            time_idx=time_idx,
+            y_pred_lower=y_pred_lower,
+            y_pred_upper=y_pred_upper,
+            confidence_level=confidence_level,
         )
         logger.info("Computed %d reservoir-specific metrics", len([k for k, v in reservoir_metrics.items() if v is not None]))
     except Exception as exc:

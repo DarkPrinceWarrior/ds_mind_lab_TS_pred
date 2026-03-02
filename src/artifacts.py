@@ -13,6 +13,7 @@ import pandas as pd
 
 try:
     from .config import PipelineConfig
+    from .conformal import apply_conformal_intervals
     from .data_validation import validate_and_report
     from .logging_config import setup_logging
     from .metrics_extended import calculate_metrics_by_horizon, print_metrics_summary
@@ -35,6 +36,7 @@ try:
     from .visualization_features import generate_feature_analysis_pdf
 except ImportError:  # pragma: no cover
     from config import PipelineConfig
+    from conformal import apply_conformal_intervals
     from data_validation import validate_and_report
     from logging_config import setup_logging
     from metrics_extended import calculate_metrics_by_horizon, print_metrics_summary
@@ -199,6 +201,41 @@ def parse_args() -> argparse.Namespace:
         choices=["chronos2", "timexer"],
         help="Forecasting model to use (default: chronos2)",
     )
+    parser.add_argument(
+        "--disable-conformal",
+        action="store_true",
+        help="Disable conformal prediction intervals",
+    )
+    parser.add_argument(
+        "--conformal-alpha",
+        type=float,
+        default=None,
+        help="Conformal miscoverage level alpha (default from config: 0.1 = 90% PI)",
+    )
+    parser.add_argument(
+        "--conformal-method",
+        type=str,
+        default=None,
+        choices=["icp", "wcp_exp", "wcp_linear"],
+        help="Conformal calibration method",
+    )
+    parser.add_argument(
+        "--conformal-exp-decay",
+        type=float,
+        default=None,
+        help="Exponential decay for WCP-exp (recent residuals weighted higher)",
+    )
+    parser.add_argument(
+        "--conformal-min-samples",
+        type=int,
+        default=None,
+        help="Minimum residual samples per horizon before fallback to global epsilon",
+    )
+    parser.add_argument(
+        "--conformal-global",
+        action="store_true",
+        help="Use one global conformal epsilon for all horizon steps",
+    )
     return parser.parse_args()
 
 
@@ -242,6 +279,18 @@ def main() -> None:
         config.chronos_input_chunk_length = int(args.chronos_input_len)
     if args.chronos_output_len:
         config.chronos_output_chunk_length = int(args.chronos_output_len)
+    if args.disable_conformal:
+        config.conformal_enabled = False
+    if args.conformal_alpha is not None:
+        config.conformal_alpha = float(args.conformal_alpha)
+    if args.conformal_method:
+        config.conformal_method = str(args.conformal_method)
+    if args.conformal_exp_decay is not None:
+        config.conformal_exp_decay = float(args.conformal_exp_decay)
+    if args.conformal_min_samples is not None:
+        config.conformal_min_samples = int(args.conformal_min_samples)
+    if args.conformal_global:
+        config.conformal_per_horizon = False
 
     if not args.disable_cache:
         try:
@@ -315,6 +364,16 @@ def main() -> None:
             )
 
     preds = train_and_forecast(frames, config)
+    conformal_profile = cv_results.get("conformal_profile") if isinstance(cv_results, dict) else None
+    if config.conformal_enabled and conformal_profile:
+        preds = apply_conformal_intervals(preds, conformal_profile, horizon=config.horizon)
+        logger.info(
+            "Applied conformal intervals to test forecast: method=%s, alpha=%.3f",
+            conformal_profile.get("method"),
+            float(conformal_profile.get("alpha", config.conformal_alpha)),
+        )
+    elif config.conformal_enabled:
+        logger.warning("Conformal enabled, but no calibration profile found in CV results.")
 
     metrics, merged = evaluate_predictions(
         preds, frames["test_df"], frames["train_df"], use_extended_metrics=True,

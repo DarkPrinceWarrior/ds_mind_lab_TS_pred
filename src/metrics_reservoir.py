@@ -355,6 +355,9 @@ def compute_all_reservoir_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     time_idx: Optional[np.ndarray] = None,
+    y_pred_lower: Optional[np.ndarray] = None,
+    y_pred_upper: Optional[np.ndarray] = None,
+    confidence_level: float = 0.9,
     pressure_true: Optional[np.ndarray] = None,
     pressure_pred: Optional[np.ndarray] = None,
     injection_rates: Optional[np.ndarray] = None,
@@ -367,6 +370,9 @@ def compute_all_reservoir_metrics(
         y_true: Actual production rates
         y_pred: Predicted production rates
         time_idx: Time indices
+        y_pred_lower: Lower prediction interval bound (optional)
+        y_pred_upper: Upper prediction interval bound (optional)
+        confidence_level: Nominal interval coverage in [0, 1]
         pressure_true: Actual pressures (optional)
         pressure_pred: Predicted pressures (optional)
         injection_rates: Injection rates (optional)
@@ -403,7 +409,13 @@ def compute_all_reservoir_metrics(
         all_metrics.update({f"waterflood_{k}": v for k, v in waterflood_metrics.items()})
     
     # 5. Reliability metrics
-    reliability_metrics = forecast_reliability_metrics(y_true, y_pred)
+    reliability_metrics = forecast_reliability_metrics(
+        y_true,
+        y_pred,
+        y_pred_lower=y_pred_lower,
+        y_pred_upper=y_pred_upper,
+        confidence_level=confidence_level,
+    )
     all_metrics.update({f"reliability_{k}": v for k, v in reliability_metrics.items()})
     
     # Filter out None and non-finite values
