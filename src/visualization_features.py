@@ -29,16 +29,18 @@ GRAPH_STATIC_COLS = [
 GRAPH_DYNAMIC_COLS = [
     "neighbor_avg_wlpr", "neighbor_avg_womr",
     "inj_wwir_crm_weighted",
+    "inj_wwir_crm_attn",
 ]
 
 PRODUCTION_COLS = [
     "wlpt", "womt", "womr", "wthp",
     "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted",
+    "inj_wwir_lag_attn", "inj_wwit_diff_lag_attn",
 ]
 
 FEATURE_GROUPS = {
     "Production / Injection": PRODUCTION_COLS,
-    "Graph (dynamic)": GRAPH_DYNAMIC_COLS,
+    "Graph (temporal)": GRAPH_DYNAMIC_COLS,
     "Graph (static topology)": GRAPH_STATIC_COLS,
     "Fourier / Embeddings": [
         "fourier_sin_1", "fourier_cos_1", "fourier_sin_2", "fourier_cos_2",
@@ -83,7 +85,7 @@ def generate_feature_analysis_pdf(
                 group_colors[c] = gname
         palette = {
             "Production / Injection": "#1f77b4",
-            "Graph (dynamic)": "#d62728",
+            "Graph (temporal)": "#d62728",
             "Graph (static topology)": "#2ca02c",
             "Fourier / Embeddings": "#9467bd",
         }
@@ -245,7 +247,13 @@ def generate_feature_analysis_pdf(
             plt.close(fig)
 
         # --- Page 7: Injection features cross-correlation with WLPR per well ---
-        inj_cols = _safe_cols(df, ["inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted"])
+        inj_cols = _safe_cols(
+            df,
+            [
+                "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted",
+                "inj_wwir_lag_attn", "inj_wwit_diff_lag_attn", "inj_wwir_crm_attn",
+            ],
+        )
         if inj_cols:
             wells = sorted(df["unique_id"].unique())
             n_wells = len(wells)
@@ -258,9 +266,10 @@ def generate_feature_analysis_pdf(
                 wd = df[df["unique_id"] == well].sort_values("ds")
                 ax.plot(wd["ds"], wd[target_col], label="WLPR", linewidth=1.2, color="black")
                 ax2 = ax.twinx()
-                colors_inj = ["#d62728", "#ff7f0e", "#2ca02c"]
+                colors_inj = ["#d62728", "#ff7f0e", "#2ca02c", "#9467bd", "#17becf", "#8c564b"]
                 for j, ic in enumerate(inj_cols):
-                    ax2.plot(wd["ds"], wd[ic], label=ic.replace("inj_", ""), linewidth=0.8, color=colors_inj[j], alpha=0.7)
+                    color = colors_inj[j % len(colors_inj)]
+                    ax2.plot(wd["ds"], wd[ic], label=ic.replace("inj_", ""), linewidth=0.8, color=color, alpha=0.7)
                 ax.set_title(f"Well {well}", fontsize=9)
                 ax.tick_params(axis="x", labelsize=7, rotation=30)
                 ax.tick_params(axis="y", labelsize=7)

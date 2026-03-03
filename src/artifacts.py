@@ -93,6 +93,16 @@ def save_artifacts(
         inj_summary.to_csv(summary_path, index=False)
         metadata["injection_summary_path"] = str(summary_path)
         metadata["injection_pairs"] = int(len(inj_summary))
+        attention_dynamic = inj_summary.attrs.get("attention_dynamic")
+        if isinstance(attention_dynamic, pd.DataFrame) and not attention_dynamic.empty:
+            alpha_path = output_dir / "alpha_dynamic.parquet"
+            try:
+                attention_dynamic.to_parquet(alpha_path, index=False)
+            except Exception:
+                alpha_path = output_dir / "alpha_dynamic.csv"
+                attention_dynamic.to_csv(alpha_path, index=False)
+            metadata["attention_dynamic_path"] = str(alpha_path)
+            metadata["attention_dynamic_rows"] = int(len(attention_dynamic))
     if pdf_paths:
         metadata["pdf_reports"] = {key: str(value) for key, value in pdf_paths.items()}
     if cv_results:
@@ -210,7 +220,7 @@ def parse_args() -> argparse.Namespace:
         "--conformal-alpha",
         type=float,
         default=None,
-        help="Conformal miscoverage level alpha (default from config: 0.1 = 90% PI)",
+        help="Conformal miscoverage level alpha (default from config: 0.1 = 90%% PI)",
     )
     parser.add_argument(
         "--conformal-method",
@@ -235,6 +245,65 @@ def parse_args() -> argparse.Namespace:
         "--conformal-global",
         action="store_true",
         help="Use one global conformal epsilon for all horizon steps",
+    )
+    parser.add_argument(
+        "--disable-inj-attention",
+        action="store_true",
+        help="Disable attention-based injector->producer aggregation features",
+    )
+    parser.add_argument(
+        "--inj-attention-target-mode",
+        type=str,
+        default=None,
+        choices=["delta", "level"],
+        help="Training target for attention weights: delta WLPR or level WLPR",
+    )
+    parser.add_argument(
+        "--inj-attention-steps",
+        type=int,
+        default=None,
+        help="Number of optimization steps for attention weight fitting",
+    )
+    parser.add_argument(
+        "--inj-attention-lr",
+        type=float,
+        default=None,
+        help="Learning rate for attention weight optimization",
+    )
+    parser.add_argument(
+        "--inj-attention-prior-strength",
+        type=float,
+        default=None,
+        help="Regularization strength toward kernel-based prior weights",
+    )
+    parser.add_argument(
+        "--inj-attention-entropy-strength",
+        type=float,
+        default=None,
+        help="Entropy regularization strength for sparse/peaked attention",
+    )
+    parser.add_argument(
+        "--inj-attention-smooth-strength",
+        type=float,
+        default=None,
+        help="Temporal smoothness regularization for causal_stage_geo alpha(t)",
+    )
+    parser.add_argument(
+        "--inj-attention-future-anchor-strength",
+        type=float,
+        default=None,
+        help="Anchor strength to train-last alpha for future horizon",
+    )
+    parser.add_argument(
+        "--inj-attention-geo-condition-strength",
+        type=float,
+        default=None,
+        help="Strength of geo-conditioned prior blending into attention weights",
+    )
+    parser.add_argument(
+        "--disable-inj-attention-stage-adaptive",
+        action="store_true",
+        help="Disable stage-adaptive gating in causal_stage_geo attention",
     )
     return parser.parse_args()
 
@@ -291,6 +360,26 @@ def main() -> None:
         config.conformal_min_samples = int(args.conformal_min_samples)
     if args.conformal_global:
         config.conformal_per_horizon = False
+    if args.disable_inj_attention:
+        config.inj_attention_enabled = False
+    if args.inj_attention_target_mode:
+        config.inj_attention_target_mode = str(args.inj_attention_target_mode)
+    if args.inj_attention_steps is not None:
+        config.inj_attention_steps = int(args.inj_attention_steps)
+    if args.inj_attention_lr is not None:
+        config.inj_attention_learning_rate = float(args.inj_attention_lr)
+    if args.inj_attention_prior_strength is not None:
+        config.inj_attention_prior_strength = float(args.inj_attention_prior_strength)
+    if args.inj_attention_entropy_strength is not None:
+        config.inj_attention_entropy_strength = float(args.inj_attention_entropy_strength)
+    if args.inj_attention_smooth_strength is not None:
+        config.inj_attention_smooth_strength = float(args.inj_attention_smooth_strength)
+    if args.inj_attention_future_anchor_strength is not None:
+        config.inj_attention_future_anchor_strength = float(args.inj_attention_future_anchor_strength)
+    if args.inj_attention_geo_condition_strength is not None:
+        config.inj_attention_geo_condition_strength = float(args.inj_attention_geo_condition_strength)
+    if args.disable_inj_attention_stage_adaptive:
+        config.inj_attention_stage_adaptive = False
 
     if not args.disable_cache:
         try:

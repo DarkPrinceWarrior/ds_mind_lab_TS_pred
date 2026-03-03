@@ -13,6 +13,7 @@
 
 - Загружает и валидирует промысловые данные
 - Строит лаговые признаки закачки с подбором лага и калибровкой ядра весов
+- Строит attention-связность `injector→producer` методом `causal_stage_geo` и признаки `inj_*_attn`
 - Добавляет пространственные, временные и графовые признаки
 - Делает split train/test по горизонту прогноза
 - Считает walk-forward кросс-валидацию
@@ -82,6 +83,33 @@ python3 -m src.artifacts \
   --conformal-alpha 0.1
 ```
 
+TimeXer + Attention (`causal_stage_geo`, default):
+
+```bash
+export CUDA_VISIBLE_DEVICES=''  # опционально: форс CPU
+python3 -m src.artifacts \
+  --model timexer \
+  --data-path MODEL_23.09.25.csv \
+  --distances-path Distance.xlsx \
+  --output-dir artifacts_timexer_attn_causal_stage_geo \
+  --conformal-method wcp_exp \
+  --conformal-alpha 0.1 \
+  --inj-attention-smooth-strength 0.05
+```
+
+Опционально, чтобы отключить stage-adaptive gating и оставить фиксированное смешивание в `causal_stage_geo`:
+
+```bash
+python3 -m src.artifacts \
+  --model timexer \
+  --data-path MODEL_23.09.25.csv \
+  --distances-path Distance.xlsx \
+  --output-dir artifacts_timexer_attn_fixed_mix \
+  --conformal-method wcp_exp \
+  --conformal-alpha 0.1 \
+  --disable-inj-attention-stage-adaptive
+```
+
 Chronos-2 с override параметров:
 
 ```bash
@@ -122,6 +150,17 @@ mlflow ui
 - `--conformal-exp-decay` коэффициент затухания для `wcp_exp` (ближе к `1.0` => медленнее забывание)
 - `--conformal-min-samples` минимум residuals на шаг горизонта для отдельной калибровки
 - `--conformal-global` использовать один глобальный `eps` для всех шагов горизонта
+- `--disable-inj-attention` отключить attention-агрегацию injector→producer
+- Метод attention фиксирован в конфиге: `causal_stage_geo` (переключение режимов через CLI удалено)
+- `--inj-attention-target-mode` target для обучения attention: `delta` или `level`
+- `--inj-attention-steps` число шагов оптимизации attention
+- `--inj-attention-lr` learning rate для attention
+- `--inj-attention-prior-strength` регуляризация к kernel-prior (`guidance`)
+- `--inj-attention-entropy-strength` энтропийная регуляризация attention
+- `--inj-attention-smooth-strength` сглаживание динамики `alpha(t)` по времени
+- `--inj-attention-future-anchor-strength` якорение future `alpha(t)` к train-last
+- `--inj-attention-geo-condition-strength` сила geo-conditioned blending в prior для attention
+- `--disable-inj-attention-stage-adaptive` отключить stage-adaptive gating (фиксированный mix в `causal_stage_geo`)
 
 ## Conformal интервалы: что это и зачем
 
@@ -192,6 +231,7 @@ well_id  x  y  z
 - `cv_metrics.json` — результаты walk-forward CV (включая `conformal_profile`, если калибровка выполнена)
 - `metadata.json` — конфиг, список скважин, окна train/test, пути отчетов
 - `injection_lag_summary.csv` — выбранные лаги/веса по парам producer-injector
+- `alpha_dynamic.parquet`/`alpha_dynamic.csv` — временные attention-веса `(ds, prod_id, inj_id, alpha, is_train, regime_id, stage_id, attention_mode)` для метода `causal_stage_geo`
 - `data_quality_report.json` — отчет по качеству данных (если валидация включена)
 - `wlpr_forecasts.pdf` — прогноз vs факт на тесте
 - `wlpr_full_history.pdf` — полная история с разметкой train/val/test

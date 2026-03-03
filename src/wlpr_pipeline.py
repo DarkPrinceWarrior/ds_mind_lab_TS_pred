@@ -258,6 +258,16 @@ def _apply_injection_lag_features(
         anisotropy=config.inj_distance_anisotropy,
         directional_bias=config.inj_directional_bias,
         use_crm=config.use_crm_filter,
+        use_attention=config.inj_attention_enabled,
+        attention_target_mode=config.inj_attention_target_mode,
+        attention_steps=config.inj_attention_steps,
+        attention_learning_rate=config.inj_attention_learning_rate,
+        attention_prior_strength=config.inj_attention_prior_strength,
+        attention_entropy_strength=config.inj_attention_entropy_strength,
+        attention_smooth_strength=config.inj_attention_smooth_strength,
+        attention_future_anchor_strength=config.inj_attention_future_anchor_strength,
+        attention_geo_condition_strength=config.inj_attention_geo_condition_strength,
+        attention_stage_adaptive=config.inj_attention_stage_adaptive,
         tau_bound_multiplier=config.tau_bound_multiplier,
         min_overlap=config.lag_min_overlap,
     )
@@ -274,11 +284,20 @@ def _apply_injection_lag_features(
         )
         pair_summary.attrs["kernel_metadata"] = kernel_metadata
     merged = prod_base.merge(injection_features, on=["ds", "well"], how="left")
-    for column in ["inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted"]:
+    for column in [
+        "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted",
+        "inj_wwir_lag_attn", "inj_wwit_diff_lag_attn", "inj_wwir_crm_attn",
+    ]:
         if column not in merged.columns:
             merged[column] = 0.0
-    merged[["inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted"]] = (
-        merged[["inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted"]].fillna(0.0)
+    merged[[
+        "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted",
+        "inj_wwir_lag_attn", "inj_wwit_diff_lag_attn", "inj_wwir_crm_attn",
+    ]] = (
+        merged[[
+            "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted",
+            "inj_wwir_lag_attn", "inj_wwit_diff_lag_attn", "inj_wwir_crm_attn",
+        ]].fillna(0.0)
     )
     return merged, pair_summary
 
@@ -936,6 +955,8 @@ def _timexer_predict(
         random_seed=config.random_seed,
         accelerator="auto",
         enable_progress_bar=True,
+        logger=False,
+        enable_checkpointing=False,
     )
 
     nf = NeuralForecast(models=[model], freq=config.freq)

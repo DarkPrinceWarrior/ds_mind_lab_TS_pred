@@ -37,7 +37,7 @@ class PipelineConfig:
     physics_injection_coeff: float = 0.05
     physics_damping: float = 0.01
     physics_smoothing_weight: float = 0.0
-    physics_features: List[str] = field(default_factory=lambda: ["inj_wwir_lag_weighted"])
+    physics_features: List[str] = field(default_factory=lambda: ["inj_wwir_lag_attn", "inj_wwir_lag_weighted"])
     physics_base_loss: str = "huber"
     # Injection kernel parameters
     inj_top_k: int = 5
@@ -50,6 +50,17 @@ class PipelineConfig:
     inj_distance_anisotropy: Optional[Dict[str, Any]] = None
     inj_directional_bias: Optional[Dict[str, Any]] = None
     use_crm_filter: bool = True
+    inj_attention_enabled: bool = True
+    inj_attention_method: str = "causal_stage_geo"
+    inj_attention_target_mode: str = "delta"
+    inj_attention_steps: int = 300
+    inj_attention_learning_rate: float = 0.05
+    inj_attention_prior_strength: float = 0.2
+    inj_attention_entropy_strength: float = 0.01
+    inj_attention_smooth_strength: float = 0.05
+    inj_attention_future_anchor_strength: float = 0.25
+    inj_attention_geo_condition_strength: float = 0.35
+    inj_attention_stage_adaptive: bool = True
     tau_bound_multiplier: float = 2.0
     lag_min_overlap: int = 6
     physics_estimates: Optional[Dict[str, float]] = None
@@ -87,6 +98,7 @@ class PipelineConfig:
         default_factory=lambda: [
             "wlpt", "womt", "womr", "wthp",
             "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted",
+            "inj_wwir_lag_attn", "inj_wwit_diff_lag_attn", "inj_wwir_crm_attn",
             "inj_top1_contribution", "inj_top2_contribution", "inj_top3_contribution",
             "ts_embed_0", "ts_embed_1", "ts_embed_2",
             "neighbor_avg_wlpr", "neighbor_avg_womr",
@@ -97,6 +109,7 @@ class PipelineConfig:
     futr_exog: List[str] = field(
         default_factory=lambda: [
             "inj_wwir_lag_weighted", "inj_wwit_diff_lag_weighted", "inj_wwir_crm_weighted",
+            "inj_wwir_lag_attn", "inj_wwit_diff_lag_attn", "inj_wwir_crm_attn",
             "inj_top1_contribution", "inj_top2_contribution", "inj_top3_contribution",
             "n2v_0", "n2v_1", "n2v_2", "n2v_3",
             "spectral_0", "spectral_1", "spectral_2", "spectral_3",
