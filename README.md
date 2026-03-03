@@ -153,10 +153,8 @@ mlflow ui
 - `--disable-inj-attention` отключить attention-агрегацию injector→producer
 - Метод attention фиксирован в конфиге: `causal_stage_geo` (переключение режимов через CLI удалено)
 - `--inj-attention-target-mode` target для обучения attention: `delta` или `level`
-- `--inj-attention-steps` число шагов оптимизации attention
-- `--inj-attention-lr` learning rate для attention
+- `--inj-attention-steps` `max_iter` для `sklearn`-обучения attention
 - `--inj-attention-prior-strength` регуляризация к kernel-prior (`guidance`)
-- `--inj-attention-entropy-strength` энтропийная регуляризация attention
 - `--inj-attention-smooth-strength` сглаживание динамики `alpha(t)` по времени
 - `--inj-attention-future-anchor-strength` якорение future `alpha(t)` к train-last
 - `--inj-attention-geo-condition-strength` сила geo-conditioned blending в prior для attention
@@ -231,7 +229,7 @@ well_id  x  y  z
 - `cv_metrics.json` — результаты walk-forward CV (включая `conformal_profile`, если калибровка выполнена)
 - `metadata.json` — конфиг, список скважин, окна train/test, пути отчетов
 - `injection_lag_summary.csv` — выбранные лаги/веса по парам producer-injector
-- `alpha_dynamic.parquet`/`alpha_dynamic.csv` — временные attention-веса `(ds, prod_id, inj_id, alpha, is_train, regime_id, stage_id, attention_mode)` для метода `causal_stage_geo`
+- `alpha_timeseries.parquet`/`alpha_timeseries.csv` — временные attention-веса `(ds, prod_id, inj_id, alpha, is_train, regime_id, stage_id, attention_mode)` для метода `causal_stage_geo`
 - `data_quality_report.json` — отчет по качеству данных (если валидация включена)
 - `wlpr_forecasts.pdf` — прогноз vs факт на тесте
 - `wlpr_full_history.pdf` — полная история с разметкой train/val/test

@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import welch
 from sklearn.feature_selection import mutual_info_regression
+from sklearn.linear_model import ElasticNet
 
 try:
     from .utils_lag import causal_xcorr_best_lag, crm_exp_filter, estimate_tau_window
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 EPSILON_DISTANCE = 1e-6
 ATTENTION_METHOD_CAUSAL_STAGE_GEO = "causal_stage_geo"
-CAUSAL_STAGE_GEO_BASE_MIX = np.asarray([0.55, 0.30, 0.15], dtype=float)
+CAUSAL_STAGE_GEO_BASE_MIX = np.asarray([0.70, 0.30], dtype=float)
 
 
 @dataclass
@@ -643,17 +644,6 @@ def _compute_causal_pairwise_features(
     }
 
 
-def _softmax(vector: np.ndarray) -> np.ndarray:
-    if vector.size == 0:
-        return vector
-    shifted = vector - np.nanmax(vector)
-    exp_values = np.exp(np.clip(shifted, -60.0, 60.0))
-    total = float(exp_values.sum())
-    if not np.isfinite(total) or total <= 0.0:
-        return np.full(vector.shape, 1.0 / max(len(vector), 1), dtype=float)
-    return exp_values / total
-
-
 def _normalize_simplex(weights: np.ndarray) -> np.ndarray:
     arr = np.asarray(weights, dtype=float)
     arr = np.where(np.isfinite(arr), np.maximum(arr, 0.0), 0.0)
@@ -668,10 +658,9 @@ def _fit_attention_weights(
     y_train: np.ndarray,
     prior: np.ndarray,
     *,
-    steps: int = 300,
-    learning_rate: float = 0.05,
+    max_iter: int = 500,
     prior_strength: float = 0.2,
-    entropy_strength: float = 0.01,
+    l1_ratio: float = 0.7,
 ) -> np.ndarray:
     if X_train.ndim != 2:
         raise ValueError(f"X_train must be 2D, got shape={X_train.shape}")
@@ -692,177 +681,29 @@ def _fit_attention_weights(
     if np.nanstd(y) <= 1e-9:
         return prior
 
-    logits = np.log(np.clip(prior, 1e-8, 1.0))
-    steps = max(int(steps), 1)
-    learning_rate = float(max(learning_rate, 1e-4))
-    prior_strength = float(max(prior_strength, 0.0))
-    entropy_strength = float(max(entropy_strength, 0.0))
+    max_iter = max(int(max_iter), 200)
+    guidance = float(np.clip(prior_strength, 0.0, 0.95))
+    l1_ratio = float(np.clip(l1_ratio, 0.0, 1.0))
+    alpha_reg = max(1e-5, 1e-3 * (1.0 - guidance))
 
-    for _ in range(steps):
-        alpha = _softmax(logits)
-        z = X @ alpha
-        design = np.column_stack([np.ones_like(z), z])
-        coeffs, *_ = np.linalg.lstsq(design, y, rcond=None)
-        prediction = design @ coeffs
-        residuals = y - prediction
-        slope = float(coeffs[1]) if len(coeffs) > 1 else 0.0
-        grad_alpha = -(2.0 * slope / len(z)) * (X.T @ residuals)
-        grad_alpha += 2.0 * prior_strength * (alpha - prior)
-        if entropy_strength > 0.0:
-            grad_alpha += entropy_strength * (np.log(np.clip(alpha, 1e-8, 1.0)) + 1.0)
-        grad_logits = alpha * (grad_alpha - float(np.dot(alpha, grad_alpha)))
-        grad_norm = float(np.linalg.norm(grad_logits))
-        if grad_norm > 5.0:
-            grad_logits *= 5.0 / grad_norm
-        logits -= learning_rate * grad_logits
-
-    return _softmax(logits)
-
-
-def _fit_dynamic_attention_weights(
-    X_rate: np.ndarray,
-    X_diff: np.ndarray,
-    X_crm: Optional[np.ndarray],
-    y_train: np.ndarray,
-    train_mask: np.ndarray,
-    prior: np.ndarray,
-    *,
-    steps: int = 300,
-    learning_rate: float = 0.03,
-    prior_strength: float = 0.2,
-    entropy_strength: float = 0.01,
-    smooth_strength: float = 0.05,
-) -> np.ndarray:
-    if X_rate.ndim != 2 or X_diff.ndim != 2:
-        raise ValueError("Dynamic attention expects 2D X_rate/X_diff matrices.")
-    n_samples, n_features = X_rate.shape
-    if n_features <= 1:
-        return np.ones((n_samples, n_features), dtype=float)
-    if X_diff.shape != (n_samples, n_features):
-        raise ValueError("X_diff shape must match X_rate shape.")
-    if X_crm is not None and X_crm.shape != (n_samples, n_features):
-        raise ValueError("X_crm shape must match X_rate shape when provided.")
-    if y_train.ndim != 1 or len(y_train) != n_samples:
-        raise ValueError("y_train must be 1D and aligned with feature rows.")
-
-    prior = _normalize_simplex(prior)
-    train_mask_arr = np.asarray(train_mask, dtype=bool)
-    if train_mask_arr.shape[0] != n_samples:
-        raise ValueError("train_mask length must match feature rows.")
-
-    finite_mask = train_mask_arr & np.isfinite(y_train)
-    finite_mask &= np.isfinite(X_rate).all(axis=1) & np.isfinite(X_diff).all(axis=1)
-    if X_crm is not None:
-        finite_mask &= np.isfinite(X_crm).all(axis=1)
-    if finite_mask.sum() < max(12, 2 * n_features):
-        return np.tile(prior, (n_samples, 1))
-    if np.nanstd(y_train[finite_mask]) <= 1e-9:
-        return np.tile(prior, (n_samples, 1))
-
-    def _standardize(full_values: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        loc = np.nanmean(full_values[mask], axis=0)
-        scale = np.nanstd(full_values[mask], axis=0)
-        scale = np.where(np.isfinite(scale) & (scale > 1e-6), scale, 1.0)
-        return (full_values - loc) / scale
-
-    X_rate_std = _standardize(X_rate, finite_mask)
-    X_diff_std = _standardize(X_diff, finite_mask)
-    X_crm_std = _standardize(X_crm, finite_mask) if X_crm is not None else None
-
-    y_loc = float(np.nanmean(y_train[finite_mask]))
-    y_scale = float(np.nanstd(y_train[finite_mask]))
-    y_scale = y_scale if np.isfinite(y_scale) and y_scale > 1e-6 else 1.0
-    y_norm = (y_train - y_loc) / y_scale
-
+    model = ElasticNet(
+        alpha=alpha_reg,
+        l1_ratio=l1_ratio,
+        fit_intercept=True,
+        positive=True,
+        max_iter=max_iter,
+        tol=1e-4,
+        selection="cyclic",
+        random_state=42,
+    )
     try:
-        import torch
-    except Exception as exc:  # pragma: no cover - torch should exist in runtime
-        logger.warning("Dynamic attention fallback to static prior (torch unavailable): %s", exc)
-        return np.tile(prior, (n_samples, 1))
-
-    device = torch.device("cpu")
-    dtype = torch.float32
-    train_idx_np = np.flatnonzero(finite_mask)
-    train_idx = torch.as_tensor(train_idx_np, dtype=torch.long, device=device)
-    x_rate = torch.as_tensor(X_rate_std, dtype=dtype, device=device)
-    x_diff = torch.as_tensor(X_diff_std, dtype=dtype, device=device)
-    x_crm = torch.as_tensor(X_crm_std, dtype=dtype, device=device) if X_crm_std is not None else None
-    y_t = torch.as_tensor(y_norm, dtype=dtype, device=device)
-    prior_t = torch.as_tensor(np.clip(prior, 1e-8, 1.0), dtype=dtype, device=device)
-
-    base_logits = torch.nn.Parameter(torch.log(prior_t))
-    coef_rate = torch.nn.Parameter(torch.zeros(n_features, dtype=dtype, device=device))
-    coef_diff = torch.nn.Parameter(torch.zeros(n_features, dtype=dtype, device=device))
-    params = [base_logits, coef_rate, coef_diff]
-    if x_crm is not None:
-        coef_crm = torch.nn.Parameter(torch.zeros(n_features, dtype=dtype, device=device))
-        params.append(coef_crm)
-    else:
-        coef_crm = None
-
-    n_channels = 2 + (1 if x_crm is not None else 0)
-    beta = torch.nn.Parameter(torch.zeros(n_channels + 1, dtype=dtype, device=device))
-    with torch.no_grad():
-        beta[1] = 1.0
-    params.append(beta)
-
-    steps = max(int(steps), 1)
-    learning_rate = float(max(learning_rate, 1e-4))
-    prior_strength = float(max(prior_strength, 0.0))
-    entropy_strength = float(max(entropy_strength, 0.0))
-    smooth_strength = float(max(smooth_strength, 0.0))
-    optimizer = torch.optim.Adam(params, lr=learning_rate)
-    best_loss = float("inf")
-    best_alpha: Optional[np.ndarray] = None
-
-    for _ in range(steps):
-        optimizer.zero_grad(set_to_none=True)
-        scores = base_logits.unsqueeze(0) + x_rate * coef_rate.unsqueeze(0) + x_diff * coef_diff.unsqueeze(0)
-        if coef_crm is not None and x_crm is not None:
-            scores = scores + x_crm * coef_crm.unsqueeze(0)
-        alpha_full = torch.softmax(scores, dim=1)
-        alpha_train = alpha_full.index_select(0, train_idx)
-
-        x_rate_train = x_rate.index_select(0, train_idx)
-        x_diff_train = x_diff.index_select(0, train_idx)
-        agg_features = [
-            torch.ones(alpha_train.shape[0], dtype=dtype, device=device),
-            torch.sum(alpha_train * x_rate_train, dim=1),
-            torch.sum(alpha_train * x_diff_train, dim=1),
-        ]
-        if x_crm is not None:
-            x_crm_train = x_crm.index_select(0, train_idx)
-            agg_features.append(torch.sum(alpha_train * x_crm_train, dim=1))
-        design = torch.stack(agg_features, dim=1)
-        y_hat = torch.sum(design * beta.unsqueeze(0), dim=1)
-        y_target = y_t.index_select(0, train_idx)
-
-        fit_loss = torch.mean((y_hat - y_target) ** 2)
-        prior_loss = prior_strength * torch.sum((torch.mean(alpha_train, dim=0) - prior_t) ** 2)
-        alpha_safe = torch.clamp(alpha_train, min=1e-8, max=1.0)
-        entropy = -torch.mean(torch.sum(alpha_safe * torch.log(alpha_safe), dim=1))
-        entropy_loss = entropy_strength * entropy
-        if alpha_full.shape[0] > 1:
-            smooth_penalty = torch.mean(torch.sum((alpha_full[1:] - alpha_full[:-1]) ** 2, dim=1))
-            smooth_loss = smooth_strength * smooth_penalty
-        else:
-            smooth_loss = torch.zeros((), dtype=dtype, device=device)
-
-        loss = fit_loss + prior_loss + entropy_loss + smooth_loss
-        if not torch.isfinite(loss):
-            break
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(params, max_norm=5.0)
-        optimizer.step()
-
-        loss_value = float(loss.detach().cpu())
-        if np.isfinite(loss_value) and loss_value < best_loss:
-            best_loss = loss_value
-            best_alpha = alpha_full.detach().cpu().numpy()
-
-    if best_alpha is None:
-        return np.tile(prior, (n_samples, 1))
-    return np.asarray(best_alpha, dtype=float)
+        model.fit(X, y)
+        learned = np.asarray(model.coef_, dtype=float)
+    except Exception:
+        learned = prior.copy()
+    learned = _normalize_simplex(learned)
+    blended = _normalize_simplex((1.0 - guidance) * learned + guidance * prior)
+    return blended
 
 
 def _build_regime_labels(
@@ -918,10 +759,8 @@ def _fit_regime_attention_weights(
     train_mask: np.ndarray,
     prior: np.ndarray,
     *,
-    steps: int = 300,
-    learning_rate: float = 0.05,
+    max_iter: int = 500,
     prior_strength: float = 0.2,
-    entropy_strength: float = 0.01,
     smooth_strength: float = 0.05,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if X_rate.ndim != 2 or X_diff.ndim != 2:
@@ -966,10 +805,8 @@ def _fit_regime_attention_weights(
             X_train,
             y_train,
             prior,
-            steps=steps,
-            learning_rate=learning_rate,
+            max_iter=max_iter,
             prior_strength=prior_strength,
-            entropy_strength=entropy_strength,
         )
 
     alpha_matrix = np.zeros((n_samples, n_features), dtype=float)
@@ -1084,7 +921,7 @@ def _build_stage_adaptive_weights(
 ) -> Tuple[np.ndarray, np.ndarray]:
     n_samples = len(weighted_rate)
     if n_samples == 0:
-        return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=int)
+        return np.zeros((0, 2), dtype=float), np.zeros(0, dtype=int)
     train_mask_arr = np.asarray(train_mask, dtype=bool)
     valid_train = train_mask_arr & np.isfinite(weighted_rate) & np.isfinite(weighted_diff)
     if valid_train.sum() < 5:
@@ -1096,12 +933,12 @@ def _build_stage_adaptive_weights(
     stage_labels = np.where(weighted_rate >= q2, 2, stage_labels)
     stage_labels = np.where((weighted_rate >= q1) & (weighted_rate < q2), 1, stage_labels)
 
-    # [regime, dynamic, static] priors by development stage.
+    # [regime, static] priors by development stage.
     stage_priors = np.asarray(
         [
-            [0.35, 0.20, 0.45],  # early / low-injection stage
-            [0.55, 0.25, 0.20],  # mid stage
-            [0.45, 0.40, 0.15],  # high-activity stage
+            [0.55, 0.45],  # early / low-injection stage
+            [0.70, 0.30],  # mid stage
+            [0.80, 0.20],  # high-activity stage
         ],
         dtype=float,
     )
@@ -1111,10 +948,9 @@ def _build_stage_adaptive_weights(
     diff_scale = diff_scale if np.isfinite(diff_scale) and diff_scale > 1e-8 else 1.0
     transition = np.clip(np.abs(weighted_diff) / diff_scale, 0.0, 1.0)
 
-    # During sharp transitions increase dynamic share and reduce static/regime smoothly.
-    mix[:, 1] += 0.25 * transition
-    mix[:, 0] -= 0.08 * transition
-    mix[:, 2] -= 0.17 * transition
+    # During sharp transitions increase regime share and reduce static share.
+    mix[:, 0] += 0.15 * transition
+    mix[:, 1] -= 0.15 * transition
     mix = np.clip(mix, 1e-4, None)
 
     base_mix = _normalize_simplex(base_mix)
@@ -1143,9 +979,7 @@ def _build_attention_matrices(
     *,
     target_mode: str = "delta",
     steps: int = 300,
-    learning_rate: float = 0.05,
     prior_strength: float = 0.2,
-    entropy_strength: float = 0.01,
     smooth_strength: float = 0.05,
     future_anchor_strength: float = 0.25,
     geo_condition_strength: float = 0.35,
@@ -1160,7 +994,7 @@ def _build_attention_matrices(
     attn_diff = pd.DataFrame(0.0, index=full_index, columns=prod_wells)
     attn_crm = pd.DataFrame(0.0, index=full_index, columns=prod_wells) if use_crm else None
     attn_weight_map: Dict[str, List[Tuple[str, float]]] = {}
-    dynamic_alpha_frames: List[pd.DataFrame] = []
+    alpha_timeseries_frames: List[pd.DataFrame] = []
 
     for prod in prod_wells:
         entries = weight_map.get(prod, [])
@@ -1202,19 +1036,6 @@ def _build_attention_matrices(
         geo_prior = _build_geo_conditioned_prior(prod, inj_ids, prior, pair_details, prod_geo, inj_geo)
         geo_strength = float(np.clip(geo_condition_strength, 0.0, 1.0))
         effective_prior = _normalize_simplex((1.0 - geo_strength) * prior + geo_strength * geo_prior)
-        alpha_dynamic = _fit_dynamic_attention_weights(
-            X_rate,
-            X_diff,
-            X_crm,
-            y_full,
-            train_mask_arr,
-            effective_prior,
-            steps=steps,
-            learning_rate=learning_rate,
-            prior_strength=prior_strength,
-            entropy_strength=entropy_strength,
-            smooth_strength=smooth_strength,
-        )
         alpha_regime, regime_labels = _fit_regime_attention_weights(
             X_rate,
             X_diff,
@@ -1222,10 +1043,8 @@ def _build_attention_matrices(
             y_full,
             train_mask_arr,
             effective_prior,
-            steps=steps,
-            learning_rate=learning_rate,
+            max_iter=steps,
             prior_strength=prior_strength,
-            entropy_strength=entropy_strength,
             smooth_strength=smooth_strength,
         )
         alpha_static = _build_static_pair_prior(prod, inj_ids, effective_prior, pair_details)
@@ -1248,8 +1067,7 @@ def _build_attention_matrices(
 
         alpha_matrix = (
             mix_matrix[:, 0:1] * alpha_regime
-            + mix_matrix[:, 1:2] * alpha_dynamic
-            + mix_matrix[:, 2:3] * alpha_static.reshape(1, -1)
+            + mix_matrix[:, 1:2] * alpha_static.reshape(1, -1)
         )
         for idx in range(alpha_matrix.shape[0]):
             alpha_matrix[idx] = _normalize_simplex(alpha_matrix[idx])
@@ -1281,7 +1099,7 @@ def _build_attention_matrices(
         regime_rep = np.repeat(np.asarray(regime_labels, dtype=int), len(inj_ids))
         stage_rep = np.repeat(np.asarray(stage_labels, dtype=int), len(inj_ids))
         prod_rep = np.repeat(np.asarray([prod], dtype=object), len(alpha_rep))
-        dynamic_alpha_frames.append(
+        alpha_timeseries_frames.append(
             pd.DataFrame(
                 {
                     "ds": ds_rep,
@@ -1295,14 +1113,14 @@ def _build_attention_matrices(
                 }
             )
         )
-    dynamic_alpha = (
-        pd.concat(dynamic_alpha_frames, ignore_index=True)
-        if dynamic_alpha_frames
+    alpha_timeseries = (
+        pd.concat(alpha_timeseries_frames, ignore_index=True)
+        if alpha_timeseries_frames
         else pd.DataFrame(
             columns=["ds", "prod_id", "inj_id", "alpha", "is_train", "regime_id", "stage_id", "attention_mode"]
         )
     )
-    return attn_rate, attn_diff, attn_crm, attn_weight_map, dynamic_alpha
+    return attn_rate, attn_diff, attn_crm, attn_weight_map, alpha_timeseries
 
 
 def _ensure_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
@@ -1370,9 +1188,7 @@ def build_injection_lag_features(
     use_attention: bool = True,
     attention_target_mode: str = "delta",
     attention_steps: int = 300,
-    attention_learning_rate: float = 0.05,
     attention_prior_strength: float = 0.2,
-    attention_entropy_strength: float = 0.01,
     attention_smooth_strength: float = 0.05,
     attention_future_anchor_strength: float = 0.25,
     attention_geo_condition_strength: float = 0.35,
@@ -1635,11 +1451,11 @@ def build_injection_lag_features(
     attn_wwit_diff = pd.DataFrame(0.0, index=full_index, columns=prod_wells)
     attn_crm = pd.DataFrame(0.0, index=full_index, columns=prod_wells) if use_crm else None
     attn_weight_map: Dict[str, List[Tuple[str, float]]] = {prod: [] for prod in prod_wells}
-    dynamic_alpha = pd.DataFrame(
+    alpha_timeseries = pd.DataFrame(
         columns=["ds", "prod_id", "inj_id", "alpha", "is_train", "regime_id", "stage_id", "attention_mode"]
     )
     if use_attention:
-        attn_rate, attn_wwit_diff, attn_crm, attn_weight_map, dynamic_alpha = _build_attention_matrices(
+        attn_rate, attn_wwit_diff, attn_crm, attn_weight_map, alpha_timeseries = _build_attention_matrices(
             prod_wells,
             weight_map,
             pair_details,
@@ -1652,9 +1468,7 @@ def build_injection_lag_features(
             inj_geo=inj_geo,
             target_mode=attention_target_mode,
             steps=attention_steps,
-            learning_rate=attention_learning_rate,
             prior_strength=attention_prior_strength,
-            entropy_strength=attention_entropy_strength,
             smooth_strength=attention_smooth_strength,
             future_anchor_strength=attention_future_anchor_strength,
             geo_condition_strength=attention_geo_condition_strength,
@@ -1737,10 +1551,10 @@ def build_injection_lag_features(
             summary_df["attn_minus_kernel"] = summary_df["attn_alpha"] - summary_df["weight"]
             if (
                 use_attention
-                and not dynamic_alpha.empty
-                and {"prod_id", "inj_id", "alpha", "is_train"} <= set(dynamic_alpha.columns)
+                and not alpha_timeseries.empty
+                and {"prod_id", "inj_id", "alpha", "is_train"} <= set(alpha_timeseries.columns)
             ):
-                dyn = dynamic_alpha.copy()
+                dyn = alpha_timeseries.copy()
                 dyn["prod_id"] = dyn["prod_id"].astype(str)
                 dyn["inj_id"] = dyn["inj_id"].astype(str)
                 dyn_train = dyn[dyn["is_train"] == True]  # noqa: E712
@@ -1764,6 +1578,6 @@ def build_injection_lag_features(
                 )
                 summary_df["attn_minus_kernel"] = summary_df["attn_alpha"] - summary_df["weight"]
     summary_df.attrs["attention_mode"] = ATTENTION_METHOD_CAUSAL_STAGE_GEO
-    if use_attention and not dynamic_alpha.empty:
-        summary_df.attrs["attention_dynamic"] = dynamic_alpha
+    if use_attention and not alpha_timeseries.empty:
+        summary_df.attrs["attention_alpha_timeseries"] = alpha_timeseries
     return features, summary_df

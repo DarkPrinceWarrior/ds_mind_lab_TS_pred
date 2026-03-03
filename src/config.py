@@ -54,9 +54,7 @@ class PipelineConfig:
     inj_attention_method: str = "causal_stage_geo"
     inj_attention_target_mode: str = "delta"
     inj_attention_steps: int = 300
-    inj_attention_learning_rate: float = 0.05
     inj_attention_prior_strength: float = 0.2
-    inj_attention_entropy_strength: float = 0.01
     inj_attention_smooth_strength: float = 0.05
     inj_attention_future_anchor_strength: float = 0.25
     inj_attention_geo_condition_strength: float = 0.35

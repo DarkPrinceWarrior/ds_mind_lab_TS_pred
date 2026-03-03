@@ -93,16 +93,16 @@ def save_artifacts(
         inj_summary.to_csv(summary_path, index=False)
         metadata["injection_summary_path"] = str(summary_path)
         metadata["injection_pairs"] = int(len(inj_summary))
-        attention_dynamic = inj_summary.attrs.get("attention_dynamic")
-        if isinstance(attention_dynamic, pd.DataFrame) and not attention_dynamic.empty:
-            alpha_path = output_dir / "alpha_dynamic.parquet"
+        attention_alpha = inj_summary.attrs.get("attention_alpha_timeseries")
+        if isinstance(attention_alpha, pd.DataFrame) and not attention_alpha.empty:
+            alpha_path = output_dir / "alpha_timeseries.parquet"
             try:
-                attention_dynamic.to_parquet(alpha_path, index=False)
+                attention_alpha.to_parquet(alpha_path, index=False)
             except Exception:
-                alpha_path = output_dir / "alpha_dynamic.csv"
-                attention_dynamic.to_csv(alpha_path, index=False)
-            metadata["attention_dynamic_path"] = str(alpha_path)
-            metadata["attention_dynamic_rows"] = int(len(attention_dynamic))
+                alpha_path = output_dir / "alpha_timeseries.csv"
+                attention_alpha.to_csv(alpha_path, index=False)
+            metadata["attention_alpha_timeseries_path"] = str(alpha_path)
+            metadata["attention_alpha_timeseries_rows"] = int(len(attention_alpha))
     if pdf_paths:
         metadata["pdf_reports"] = {key: str(value) for key, value in pdf_paths.items()}
     if cv_results:
@@ -262,25 +262,13 @@ def parse_args() -> argparse.Namespace:
         "--inj-attention-steps",
         type=int,
         default=None,
-        help="Number of optimization steps for attention weight fitting",
-    )
-    parser.add_argument(
-        "--inj-attention-lr",
-        type=float,
-        default=None,
-        help="Learning rate for attention weight optimization",
+        help="max_iter for sklearn attention fitting",
     )
     parser.add_argument(
         "--inj-attention-prior-strength",
         type=float,
         default=None,
         help="Regularization strength toward kernel-based prior weights",
-    )
-    parser.add_argument(
-        "--inj-attention-entropy-strength",
-        type=float,
-        default=None,
-        help="Entropy regularization strength for sparse/peaked attention",
     )
     parser.add_argument(
         "--inj-attention-smooth-strength",
@@ -366,12 +354,8 @@ def main() -> None:
         config.inj_attention_target_mode = str(args.inj_attention_target_mode)
     if args.inj_attention_steps is not None:
         config.inj_attention_steps = int(args.inj_attention_steps)
-    if args.inj_attention_lr is not None:
-        config.inj_attention_learning_rate = float(args.inj_attention_lr)
     if args.inj_attention_prior_strength is not None:
         config.inj_attention_prior_strength = float(args.inj_attention_prior_strength)
-    if args.inj_attention_entropy_strength is not None:
-        config.inj_attention_entropy_strength = float(args.inj_attention_entropy_strength)
     if args.inj_attention_smooth_strength is not None:
         config.inj_attention_smooth_strength = float(args.inj_attention_smooth_strength)
     if args.inj_attention_future_anchor_strength is not None:
