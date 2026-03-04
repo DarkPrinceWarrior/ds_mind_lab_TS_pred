@@ -133,14 +133,14 @@ class PipelineConfig:
     # XLinear configuration (NeuralForecast)
     xlinear_hidden_size: int = 128
     xlinear_temporal_ff: int = 256
-    xlinear_channel_ff: int = 24  # sufficient capacity for VGM with ~47 exog features
+    xlinear_channel_ff: int = 24  # optimal for ~30 channels (13 wells + 17 exog)
     xlinear_temporal_dropout: float = 0.15
     xlinear_channel_dropout: float = 0.10
     xlinear_embed_dropout: float = 0.10
     xlinear_head_dropout: float = 0.10
     xlinear_max_steps: int = 2000
-    xlinear_learning_rate: float = 5e-4
-    xlinear_batch_size: int = 32
+    xlinear_learning_rate: float = 1e-3
+    xlinear_batch_size: int = 64
     xlinear_windows_batch_size: int = 64
     xlinear_early_stop_patience: int = 15
     xlinear_val_check_steps: int = 50

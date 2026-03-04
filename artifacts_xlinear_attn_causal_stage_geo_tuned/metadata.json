@@ -216,8 +216,8 @@
     "xlinear_embed_dropout": 0.1,
     "xlinear_head_dropout": 0.1,
     "xlinear_max_steps": 2000,
-    "xlinear_learning_rate": 0.0005,
-    "xlinear_batch_size": 32,
+    "xlinear_learning_rate": 0.001,
+    "xlinear_batch_size": 64,
     "xlinear_windows_batch_size": 64,
     "xlinear_early_stop_patience": 15,
     "xlinear_val_check_steps": 50,
@@ -264,19 +264,19 @@
   "walk_forward_cv": {
     "folds": 6,
     "aggregate": {
-      "mae": 8.318718754259262,
-      "rmse": 15.315697103007787,
-      "mape": 7.184138666464581,
-      "smape": 8.062388260124951,
-      "wmape": 5.444658669978606,
-      "mase": 1.8333478798763057,
-      "r2": 0.9830988631721782,
-      "nse": 0.9830988631721782,
-      "kge": 0.9661406752142622,
-      "pbias": 2.8761314400025584,
-      "index_of_agreement": 0.9957509730425065,
-      "mean_bias_error": -4.392350106034757,
-      "correlation": 0.9924865929421394
+      "mae": 8.029418710402002,
+      "rmse": 14.1782094928063,
+      "mape": 6.680662844213363,
+      "smape": 7.308549155236889,
+      "wmape": 5.255378936892922,
+      "mase": 1.7671300579109315,
+      "r2": 0.9861832142560698,
+      "nse": 0.9861832142560698,
+      "kge": 0.9713171677146141,
+      "pbias": 2.392932954901037,
+      "index_of_agreement": 0.9965322767908574,
+      "mean_bias_error": -3.653714024489995,
+      "correlation": 0.9936736268677444
     },
     "details_path": "artifacts_xlinear_attn_causal_stage_geo_tuned/cv_metrics.json"
   }
