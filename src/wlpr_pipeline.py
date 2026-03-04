@@ -950,6 +950,7 @@ def _xlinear_predict(
         windows_batch_size=config.xlinear_windows_batch_size,
         early_stop_patience_steps=config.xlinear_early_stop_patience,
         val_check_steps=config.xlinear_val_check_steps,
+        use_norm=True,
         scaler_type=config.xlinear_scaler_type,
         random_seed=config.random_seed,
         accelerator="auto",

@@ -138,8 +138,8 @@ class PipelineConfig:
     # XLinear configuration (NeuralForecast)
     xlinear_hidden_size: int = 128
     xlinear_temporal_ff: int = 256
-    xlinear_channel_ff: int = 8  # keep multiple of n_series for stronger cross-channel mixing
-    xlinear_temporal_dropout: float = 0.25
+    xlinear_channel_ff: int = 24  # sufficient capacity for VGM with ~47 exog features
+    xlinear_temporal_dropout: float = 0.15
     xlinear_channel_dropout: float = 0.10
     xlinear_embed_dropout: float = 0.10
     xlinear_head_dropout: float = 0.10
@@ -150,5 +150,5 @@ class PipelineConfig:
     xlinear_early_stop_patience: int = 10
     xlinear_val_check_steps: int = 50
     xlinear_scaler_type: str = "robust"  # outlier-resistant (wells 14, 23)
-    xlinear_loss: str = "mae"        # robust to outliers
+    xlinear_loss: str = "huber"      # compromise: paper uses MSE, huber adds outlier robustness
     xlinear_num_lr_decays: int = 3   # LR decays across max_steps
