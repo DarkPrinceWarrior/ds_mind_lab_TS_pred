@@ -143,12 +143,12 @@ class PipelineConfig:
     xlinear_channel_dropout: float = 0.10
     xlinear_embed_dropout: float = 0.10
     xlinear_head_dropout: float = 0.10
-    xlinear_max_steps: int = 1000
+    xlinear_max_steps: int = 2000
     xlinear_learning_rate: float = 5e-4
     xlinear_batch_size: int = 32
     xlinear_windows_batch_size: int = 64
-    xlinear_early_stop_patience: int = 10
+    xlinear_early_stop_patience: int = 15
     xlinear_val_check_steps: int = 50
     xlinear_scaler_type: str = "robust"  # outlier-resistant (wells 14, 23)
     xlinear_loss: str = "huber"      # compromise: paper uses MSE, huber adds outlier robustness
-    xlinear_num_lr_decays: int = 3   # LR decays across max_steps
+    xlinear_num_lr_decays: int = 5   # LR decays across max_steps
