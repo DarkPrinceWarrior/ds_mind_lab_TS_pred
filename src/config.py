@@ -20,7 +20,7 @@ class PipelineConfig:
     val_horizon: int = 6
     freq: str = "MS"
     min_history: int = 60
-    input_size: int = 48
+    input_size: int = 36
     random_seed: int = 42
     cv_folds: int = 6
     cv_step: int = 6
