@@ -134,22 +134,21 @@ class PipelineConfig:
     )
     chronos_kwargs: Dict[str, Any] = field(default_factory=dict)
     # Model selection
-    model_type: str = "chronos2"  # "chronos2" or "timexer"
-    # TimeXer configuration
-    # Architecture: ~135K params, ratio ~81:1 with 1664 training windows.
-    # Regularized via dropout=0.25, robust scaler, early stopping, lr decay.
-    timexer_patch_len: int = 6       # 6 months per patch = half-year semantics
-    timexer_hidden_size: int = 64    # enough capacity for 29 covariates
-    timexer_n_heads: int = 4         # head_dim=16, stable attention
-    timexer_e_layers: int = 2        # 2 layers for self-attn + cross-attn depth
-    timexer_d_ff: int = 64           # compact FFN (1:1 with hidden)
-    timexer_dropout: float = 0.25    # moderate regularization
-    timexer_max_steps: int = 1000
-    timexer_learning_rate: float = 5e-4
-    timexer_batch_size: int = 32
-    timexer_windows_batch_size: int = 64
-    timexer_early_stop_patience: int = 10
-    timexer_val_check_steps: int = 50
-    timexer_scaler_type: str = "robust"  # outlier-resistant (wells 14, 23)
-    timexer_loss: str = "mae"        # robust to outliers, default in paper
-    timexer_num_lr_decays: int = 3   # 3 LR decays across max_steps
+    model_type: str = "chronos2"  # "chronos2" or "xlinear"
+    # XLinear configuration (NeuralForecast)
+    xlinear_hidden_size: int = 128
+    xlinear_temporal_ff: int = 256
+    xlinear_channel_ff: int = 8  # keep multiple of n_series for stronger cross-channel mixing
+    xlinear_temporal_dropout: float = 0.25
+    xlinear_channel_dropout: float = 0.10
+    xlinear_embed_dropout: float = 0.10
+    xlinear_head_dropout: float = 0.10
+    xlinear_max_steps: int = 1000
+    xlinear_learning_rate: float = 5e-4
+    xlinear_batch_size: int = 32
+    xlinear_windows_batch_size: int = 64
+    xlinear_early_stop_patience: int = 10
+    xlinear_val_check_steps: int = 50
+    xlinear_scaler_type: str = "robust"  # outlier-resistant (wells 14, 23)
+    xlinear_loss: str = "mae"        # robust to outliers
+    xlinear_num_lr_decays: int = 3   # LR decays across max_steps

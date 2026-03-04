@@ -4,7 +4,7 @@
 
 Поддерживаемые модели:
 - `chronos2` (Amazon Chronos-2, zero-shot через Darts)
-- `timexer` (обучаемая модель TimeXer через NeuralForecast)
+- `xlinear` (обучаемая модель XLinear через NeuralForecast)
 
 Текущий CLI entrypoint:
 - `python3 -m src.artifacts`
@@ -60,38 +60,38 @@ python3 -m src.artifacts \
   --output-dir artifacts
 ```
 
-TimeXer:
+XLinear:
 
 ```bash
 python3 -m src.artifacts \
-  --model timexer \
+  --model xlinear \
   --data-path MODEL_23.09.25.csv \
   --distances-path Distance.xlsx \
-  --output-dir artifacts_timexer
+  --output-dir artifacts_xlinear
 ```
 
-TimeXer + Conformal (WCP, 90% PI):
+XLinear + Conformal (WCP, 90% PI):
 
 ```bash
 export CUDA_VISIBLE_DEVICES=''  # опционально: форс CPU
 python3 -m src.artifacts \
-  --model timexer \
+  --model xlinear \
   --data-path MODEL_23.09.25.csv \
   --distances-path Distance.xlsx \
-  --output-dir artifacts_timexer \
+  --output-dir artifacts_xlinear \
   --conformal-method wcp_exp \
   --conformal-alpha 0.1
 ```
 
-TimeXer + Attention (`causal_stage_geo`, default):
+XLinear + Attention (`causal_stage_geo`, default):
 
 ```bash
 export CUDA_VISIBLE_DEVICES=''  # опционально: форс CPU
 python3 -m src.artifacts \
-  --model timexer \
+  --model xlinear \
   --data-path MODEL_23.09.25.csv \
   --distances-path Distance.xlsx \
-  --output-dir artifacts_timexer_attn_causal_stage_geo \
+  --output-dir artifacts_xlinear_attn_causal_stage_geo \
   --conformal-method wcp_exp \
   --conformal-alpha 0.1 \
   --inj-attention-smooth-strength 0.05
@@ -101,10 +101,10 @@ python3 -m src.artifacts \
 
 ```bash
 python3 -m src.artifacts \
-  --model timexer \
+  --model xlinear \
   --data-path MODEL_23.09.25.csv \
   --distances-path Distance.xlsx \
-  --output-dir artifacts_timexer_attn_fixed_mix \
+  --output-dir artifacts_xlinear_attn_fixed_mix \
   --conformal-method wcp_exp \
   --conformal-alpha 0.1 \
   --disable-inj-attention-stage-adaptive
@@ -133,7 +133,7 @@ mlflow ui
 - `--distances-path` путь к `Distance.xlsx` (координаты + матрица расстояний)
 - `--coords-path` legacy-файл координат (если не задан, берется `--distances-path`)
 - `--output-dir` директория для артефактов (по умолчанию `artifacts`)
-- `--model` тип модели: `chronos2` или `timexer`
+- `--model` тип модели: `chronos2` или `xlinear`
 - `--chronos-model` имя модели на Hugging Face для Chronos-2
 - `--chronos-revision` ревизия/тег модели Chronos-2
 - `--chronos-local-dir` локальная директория кэша Chronos-2
@@ -245,12 +245,12 @@ well_id  x  y  z
 Пример:
 
 ```bash
-python3 scripts/scenario_shutoff_34.py --model timexer
+python3 scripts/scenario_shutoff_34.py --model xlinear
 ```
 
 Результаты:
 
-- `artifacts_timexer/scenario_shutoff_34/` для `--model timexer`
+- `artifacts_xlinear/scenario_shutoff_34/` для `--model xlinear`
 - `artifacts/scenario_shutoff_34/` для `--model chronos2`
 
 Внутри:
@@ -271,7 +271,7 @@ from src.wlpr_pipeline import (
     prepare_model_frames, train_and_forecast, evaluate_predictions,
 )
 
-config = PipelineConfig(model_type="timexer")
+config = PipelineConfig(model_type="xlinear")
 raw = load_raw_data("MODEL_23.09.25.csv")
 coords = load_coordinates("Distance.xlsx")
 dist = load_distance_matrix("Distance.xlsx")

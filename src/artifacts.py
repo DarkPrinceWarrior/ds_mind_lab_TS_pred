@@ -121,7 +121,7 @@ def save_artifacts(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="WLPR forecasting pipeline using Chronos-2")
+    parser = argparse.ArgumentParser(description="WLPR forecasting pipeline using Chronos-2 or XLinear")
     parser.add_argument(
         "--data-path",
         type=Path,
@@ -208,7 +208,7 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default="chronos2",
-        choices=["chronos2", "timexer"],
+        choices=["chronos2", "xlinear"],
         help="Forecasting model to use (default: chronos2)",
     )
     parser.add_argument(
@@ -386,9 +386,10 @@ def main() -> None:
         if tracker:
             tracker.start_run()
             tracker.log_config(config)
+            model_label = "Chronos-2" if args.model == "chronos2" else "XLinear"
             tracker.set_tags({
                 "pipeline": "wlpr_forecasting",
-                "model": "Chronos-2",
+                "model": model_label,
             })
             logger.info("MLflow tracking enabled")
 

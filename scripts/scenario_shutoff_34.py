@@ -76,7 +76,7 @@ def _generate_scenario_pdf(
     wells_other = sorted([w for w in wells if w not in connected_prods])
     ordered_wells = wells_connected + wells_other
 
-    model_label = {"chronos2": "Chronos-2", "timexer": "TimeXer"}.get(model_name, model_name)
+    model_label = {"chronos2": "Chronos-2", "xlinear": "XLinear"}.get(model_name, model_name)
 
     with PdfPages(pdf_path) as pdf:
         # --- Стр. 1: Сводная таблица ---
@@ -213,10 +213,10 @@ def run_scenario(raw_df: pd.DataFrame, coords, config, distances, label: str):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="chronos2", choices=["chronos2", "timexer"])
+    parser.add_argument("--model", default="chronos2", choices=["chronos2", "xlinear"])
     args = parser.parse_args()
 
-    base_artifacts = Path("artifacts_timexer") if args.model == "timexer" else Path("artifacts")
+    base_artifacts = Path("artifacts_xlinear") if args.model == "xlinear" else Path("artifacts")
     out_dir = base_artifacts / "scenario_shutoff_34"
     out_dir.mkdir(parents=True, exist_ok=True)
     config = PipelineConfig(model_type=args.model)

@@ -474,8 +474,8 @@ def run_walk_forward_validation(
             fold_val = fold_val_raw
             fold_static_df = static_df
 
-        if config.model_type == "timexer":
-            preds = _timexer_predict(fold_train, fold_val, config)
+        if config.model_type == "xlinear":
+            preds = _xlinear_predict(fold_train, fold_val, config)
         else:
             cov_cols = list(set(config.hist_exog + config.futr_exog))
             available_cols = [c for c in cov_cols if c in fold_train.columns]
@@ -906,20 +906,20 @@ def _chronos2_predict(
 
 
 # ---------------------------------------------------------------------------
-# TimeXer model
+# XLinear model
 # ---------------------------------------------------------------------------
 
-def _timexer_predict(
+def _xlinear_predict(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     config: PipelineConfig,
 ) -> pd.DataFrame:
     from neuralforecast import NeuralForecast
-    from neuralforecast.models import TimeXer
+    from neuralforecast.models import XLinear
     from neuralforecast.losses.pytorch import MAE, MSE, HuberLoss
 
     loss_map = {"mse": MSE(), "mae": MAE(), "huber": HuberLoss()}
-    loss_fn = loss_map.get(config.timexer_loss, MSE())
+    loss_fn = loss_map.get(config.xlinear_loss, MSE())
 
     futr_cols = [c for c in config.futr_exog if c in train_df.columns]
     hist_cols = [c for c in config.hist_exog if c in train_df.columns and c not in futr_cols]
@@ -927,29 +927,30 @@ def _timexer_predict(
 
     n_series = train_df["unique_id"].nunique()
 
-    model = TimeXer(
+    model = XLinear(
         h=config.horizon,
         input_size=config.input_size,
         n_series=n_series,
         futr_exog_list=futr_cols if futr_cols else None,
         hist_exog_list=hist_cols if hist_cols else None,
         stat_exog_list=stat_cols if stat_cols else None,
-        patch_len=config.timexer_patch_len,
-        hidden_size=config.timexer_hidden_size,
-        n_heads=config.timexer_n_heads,
-        e_layers=config.timexer_e_layers,
-        d_ff=config.timexer_d_ff,
-        dropout=config.timexer_dropout,
+        hidden_size=config.xlinear_hidden_size,
+        temporal_ff=config.xlinear_temporal_ff,
+        channel_ff=config.xlinear_channel_ff,
+        temporal_dropout=config.xlinear_temporal_dropout,
+        channel_dropout=config.xlinear_channel_dropout,
+        embed_dropout=config.xlinear_embed_dropout,
+        head_dropout=config.xlinear_head_dropout,
         loss=loss_fn,
         valid_loss=MAE(),
-        max_steps=config.timexer_max_steps,
-        learning_rate=config.timexer_learning_rate,
-        num_lr_decays=config.timexer_num_lr_decays,
-        batch_size=config.timexer_batch_size,
-        windows_batch_size=config.timexer_windows_batch_size,
-        early_stop_patience_steps=config.timexer_early_stop_patience,
-        val_check_steps=config.timexer_val_check_steps,
-        scaler_type=config.timexer_scaler_type,
+        max_steps=config.xlinear_max_steps,
+        learning_rate=config.xlinear_learning_rate,
+        num_lr_decays=config.xlinear_num_lr_decays,
+        batch_size=config.xlinear_batch_size,
+        windows_batch_size=config.xlinear_windows_batch_size,
+        early_stop_patience_steps=config.xlinear_early_stop_patience,
+        val_check_steps=config.xlinear_val_check_steps,
+        scaler_type=config.xlinear_scaler_type,
         random_seed=config.random_seed,
         accelerator="auto",
         enable_progress_bar=True,
@@ -968,11 +969,10 @@ def _timexer_predict(
         nf_train = nf_train.drop(columns=stat_cols, errors="ignore")
 
     logger.info(
-        "TimeXer config: input=%d, h=%d, n_series=%d, patch=%d, hidden=%d, "
-        "heads=%d, layers=%d, futr=%d cols, hist=%d cols, stat=%d cols",
+        "XLinear config: input=%d, h=%d, n_series=%d, hidden=%d, temporal_ff=%d, "
+        "channel_ff=%d, futr=%d cols, hist=%d cols, stat=%d cols",
         config.input_size, config.horizon, n_series,
-        config.timexer_patch_len, config.timexer_hidden_size,
-        config.timexer_n_heads, config.timexer_e_layers,
+        config.xlinear_hidden_size, config.xlinear_temporal_ff, config.xlinear_channel_ff,
         len(futr_cols), len(hist_cols), len(stat_cols),
     )
 
@@ -985,9 +985,9 @@ def _timexer_predict(
     forecasts = nf.predict(futr_df=futr_df, static_df=static_df)
     forecasts = forecasts.reset_index()
 
-    timexer_col = [c for c in forecasts.columns if c.startswith("TimeXer")]
-    if timexer_col:
-        forecasts = forecasts.rename(columns={timexer_col[0]: "y_hat"})
+    xlinear_col = [c for c in forecasts.columns if c.startswith("XLinear")]
+    if xlinear_col:
+        forecasts = forecasts.rename(columns={xlinear_col[0]: "y_hat"})
     elif "y_hat" not in forecasts.columns:
         val_cols = [c for c in forecasts.columns if c not in {"unique_id", "ds"}]
         if val_cols:
@@ -1004,9 +1004,9 @@ def train_and_forecast(frames: Dict[str, pd.DataFrame], config: PipelineConfig) 
     train_df = frames["train_df"]
     test_df = frames["test_df"]
 
-    if config.model_type == "timexer":
-        preds = _timexer_predict(train_df, test_df, config)
-        logger.info("Generated %d TimeXer forecast rows", len(preds))
+    if config.model_type == "xlinear":
+        preds = _xlinear_predict(train_df, test_df, config)
+        logger.info("Generated %d XLinear forecast rows", len(preds))
         return preds
 
     cov_cols = list(set(config.hist_exog + config.futr_exog))
