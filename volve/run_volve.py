@@ -74,10 +74,10 @@ def generate_forecast_pdf(
                 title += f" | R\u00b2={r2_val:.4f}"
             ax.set_title(title)
             ax.legend(loc="best", fontsize=8)
-            ax.set_ylabel("Liquid Rate (Sm\u00b3/d)")
+            ax.set_ylabel("Oil Rate (Sm\u00b3/d)")
             ax.grid(True, alpha=0.3)
         axes[-1, 0].set_xlabel("Date")
-        fig.suptitle("Volve - XLinear Daily Liquid Rate Forecast", fontsize=14, y=1.01)
+        fig.suptitle("Volve - XLinear Daily Oil Rate Forecast", fontsize=14, y=1.01)
         fig.tight_layout()
         pdf_path = output_dir / "volve_forecasts.pdf"
         fig.savefig(pdf_path, bbox_inches="tight")
@@ -117,10 +117,10 @@ def generate_full_history_pdf(
                 ax.axvline(test_start, color="red", linestyle=":", alpha=0.5, label="Test start")
             ax.set_title(well)
             ax.legend(loc="best", fontsize=8)
-            ax.set_ylabel("Liquid Rate (Sm\u00b3/d)")
+            ax.set_ylabel("Oil Rate (Sm\u00b3/d)")
             ax.grid(True, alpha=0.3)
         axes[-1, 0].set_xlabel("Date")
-        fig.suptitle("Volve - Full Production History + Forecast", fontsize=14, y=1.01)
+        fig.suptitle("Volve - Full Oil Production History + Forecast", fontsize=14, y=1.01)
         fig.tight_layout()
         pdf_path = output_dir / "volve_full_history.pdf"
         fig.savefig(pdf_path, bbox_inches="tight")
@@ -165,7 +165,7 @@ def save_artifacts(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Volve daily liquid rate forecasting (XLinear)")
+    parser = argparse.ArgumentParser(description="Volve daily oil rate forecasting (XLinear)")
     parser.add_argument(
         "--data-path",
         type=Path,
@@ -187,7 +187,7 @@ def main() -> None:
 
     start_time = time.perf_counter()
     logger.info("=" * 60)
-    logger.info("Volve Daily Liquid Rate Forecasting Pipeline (XLinear)")
+    logger.info("Volve Daily Oil Rate Forecasting Pipeline (XLinear)")
     logger.info("Timestamp: %s", datetime.now().isoformat())
     logger.info("=" * 60)
 

@@ -65,11 +65,10 @@ def _compute_production_features(df: pd.DataFrame) -> pd.DataFrame:
     df["wat_vol"] = df["wat_vol"].fillna(0.0).clip(lower=0.0)
     df["gas_vol"] = df["gas_vol"].fillna(0.0).clip(lower=0.0)
 
-    df["wlpr"] = df["oil_vol"] + df["wat_vol"]
-    df["womr"] = df["oil_vol"]
+    df["water_rate"] = df["wat_vol"]
     df["gas_rate"] = df["gas_vol"]
-    total = df["wlpr"].clip(lower=EPSILON)
-    df["watercut"] = (df["wat_vol"] / total).clip(0.0, 1.0).fillna(0.0)
+    liq = (df["oil_vol"] + df["wat_vol"]).clip(lower=EPSILON)
+    df["watercut"] = (df["wat_vol"] / liq).clip(0.0, 1.0).fillna(0.0)
 
     for col in ["avg_downhole_pressure", "avg_downhole_temperature",
                  "avg_dp_tubing", "avg_whp", "avg_choke_size", "on_stream_hrs"]:
@@ -149,7 +148,7 @@ def prepare_volve_frames(
     prod_df = _compute_field_injection(prod_df, inj_daily)
 
     prod_df["unique_id"] = prod_df["well"]
-    prod_df["y"] = prod_df["wlpr"].astype(float)
+    prod_df["y"] = prod_df["oil_vol"].astype(float)
     prod_df["time_idx"] = prod_df.sort_values("ds").groupby("well").cumcount()
 
     # Train/test split

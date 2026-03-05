@@ -24,7 +24,7 @@ class VolveConfig:
 
     hist_exog: List[str] = field(
         default_factory=lambda: [
-            "womr",
+            "water_rate",
             "gas_rate",
             "watercut",
             "avg_whp",
