@@ -9,7 +9,7 @@ class VolveConfig:
     horizon: int = 30
     val_horizon: int = 30
     freq: str = "D"
-    min_history: int = 365
+    min_history: int = 700
     input_size: int = 60
     random_seed: int = 42
     cv_folds: int = 3
@@ -27,6 +27,7 @@ class VolveConfig:
             "water_rate",
             "gas_rate",
             "watercut",
+            "gor",
             "avg_whp",
             "avg_dp_tubing",
             "avg_choke_size",
@@ -34,11 +35,32 @@ class VolveConfig:
             "avg_downhole_pressure",
             "avg_downhole_temperature",
             "field_inj_rate",
+            "oil_ma7",
+            "oil_ma14",
+            "oil_ma30",
+            "oil_std7",
+            "oil_std30",
+            "oil_diff",
+            "oil_diff_ma7",
+            "oil_diff_ma30",
+            "oil_pct_change",
+            "water_ma7",
+            "whp_ma7",
+            "doy_sin",
+            "doy_cos",
+            "dow_sin",
+            "dow_cos",
+            "productivity_index",
+            "dp_drawdown",
         ]
     )
     futr_exog: List[str] = field(
         default_factory=lambda: [
             "field_inj_rate",
+            "doy_sin",
+            "doy_cos",
+            "dow_sin",
+            "dow_cos",
         ]
     )
     static_exog: List[str] = field(default_factory=list)
@@ -51,7 +73,7 @@ class VolveConfig:
     xlinear_channel_dropout: float = 0.10
     xlinear_embed_dropout: float = 0.10
     xlinear_head_dropout: float = 0.10
-    xlinear_max_steps: int = 2000
+    xlinear_max_steps: int = 3000
     xlinear_learning_rate: float = 1e-3
     xlinear_batch_size: int = 64
     xlinear_windows_batch_size: int = 64

@@ -40,6 +40,10 @@ WELL_SHORT_NAMES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Data loading & cleaning
+# ---------------------------------------------------------------------------
+
 def load_volve_data(path: Path) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name="Daily Production Data", engine="openpyxl")
     rename = {k: v for k, v in VOLVE_COL_MAP.items() if k in df.columns}
@@ -59,6 +63,49 @@ def load_volve_data(path: Path) -> pd.DataFrame:
     return df
 
 
+def _filter_shutdown_days(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove days where on_stream_hrs == 0 (well shut-in / maintenance)."""
+    before = len(df)
+    mask = df["on_stream_hrs"] > 0
+    if "oil_vol" in df.columns:
+        mask = mask | (df["oil_vol"] > 0)
+    df = df[mask].copy()
+    removed = before - len(df)
+    if removed > 0:
+        logger.info("Removed %d shutdown days (on_stream=0 & oil=0)", removed)
+    return df
+
+
+def _trim_permanent_shutdown(df: pd.DataFrame, min_tail_zeros: int = 14) -> pd.DataFrame:
+    """Trim consecutive zero-production tail from each well (field abandonment)."""
+    frames = []
+    for well in df["well"].unique():
+        date_col = "ds" if "ds" in df.columns else "date"
+        wd = df[df["well"] == well].sort_values(date_col)
+        if wd.empty:
+            frames.append(wd)
+            continue
+        oil = wd["oil_vol"].values
+        # Find last non-zero production day
+        nonzero_idx = np.where(oil > 0)[0]
+        if len(nonzero_idx) == 0:
+            continue
+        last_production = nonzero_idx[-1]
+        tail_zeros = len(oil) - 1 - last_production
+        if tail_zeros >= min_tail_zeros:
+            # Keep up to a few days past last production
+            cut = last_production + 3
+            trimmed = len(wd) - cut
+            wd = wd.iloc[:cut]
+            logger.info("Trimmed %d shutdown days from tail of well %s", trimmed, well)
+        frames.append(wd)
+    return pd.concat(frames, ignore_index=True) if frames else df
+
+
+# ---------------------------------------------------------------------------
+# Feature engineering
+# ---------------------------------------------------------------------------
+
 def _compute_production_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["oil_vol"] = df["oil_vol"].fillna(0.0).clip(lower=0.0)
@@ -69,11 +116,82 @@ def _compute_production_features(df: pd.DataFrame) -> pd.DataFrame:
     df["gas_rate"] = df["gas_vol"]
     liq = (df["oil_vol"] + df["wat_vol"]).clip(lower=EPSILON)
     df["watercut"] = (df["wat_vol"] / liq).clip(0.0, 1.0).fillna(0.0)
+    # GOR (gas-oil ratio)
+    df["gor"] = (df["gas_vol"] / df["oil_vol"].clip(lower=EPSILON)).clip(upper=1e5).fillna(0.0)
 
     for col in ["avg_downhole_pressure", "avg_downhole_temperature",
                  "avg_dp_tubing", "avg_whp", "avg_choke_size", "on_stream_hrs"]:
         if col in df.columns:
             df[col] = df[col].fillna(0.0)
+    return df
+
+
+def _compute_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Rolling statistics and decline-rate features per well."""
+    df = df.copy()
+    for well in df["well"].unique():
+        mask = df["well"] == well
+        oil = df.loc[mask, "oil_vol"]
+        df.loc[mask, "oil_ma7"] = oil.rolling(7, min_periods=1).mean()
+        df.loc[mask, "oil_ma14"] = oil.rolling(14, min_periods=1).mean()
+        df.loc[mask, "oil_ma30"] = oil.rolling(30, min_periods=1).mean()
+        df.loc[mask, "oil_std7"] = oil.rolling(7, min_periods=2).std().fillna(0.0)
+        df.loc[mask, "oil_std30"] = oil.rolling(30, min_periods=2).std().fillna(0.0)
+        # Decline rate features
+        df.loc[mask, "oil_diff"] = oil.diff().fillna(0.0)
+        df.loc[mask, "oil_diff_ma7"] = oil.diff().rolling(7, min_periods=1).mean().fillna(0.0)
+        df.loc[mask, "oil_diff_ma30"] = oil.diff().rolling(30, min_periods=1).mean().fillna(0.0)
+        pct = oil.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0).clip(-1.0, 1.0)
+        df.loc[mask, "oil_pct_change"] = pct
+        # Water rolling
+        if "water_rate" in df.columns:
+            wat = df.loc[mask, "water_rate"]
+            df.loc[mask, "water_ma7"] = wat.rolling(7, min_periods=1).mean()
+        # Pressure rolling
+        if "avg_whp" in df.columns:
+            whp = df.loc[mask, "avg_whp"]
+            df.loc[mask, "whp_ma7"] = whp.rolling(7, min_periods=1).mean()
+    return df
+
+
+def _compute_fourier_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Day-of-year seasonality features (analogous to main pipeline fourier features)."""
+    df = df.copy()
+    day_of_year = df["ds"].dt.dayofyear.astype(float)
+    df["doy_sin"] = np.sin(2 * np.pi * day_of_year / 365.25)
+    df["doy_cos"] = np.cos(2 * np.pi * day_of_year / 365.25)
+    df["dow_sin"] = np.sin(2 * np.pi * df["ds"].dt.dayofweek / 7.0)
+    df["dow_cos"] = np.cos(2 * np.pi * df["ds"].dt.dayofweek / 7.0)
+    return df
+
+
+def _compute_productivity_index(
+    df: pd.DataFrame, train_cutoff: pd.Timestamp,
+) -> pd.DataFrame:
+    """Productivity index J(t) and drawdown -- analogous to main pipeline PI feature."""
+    df = df.copy()
+    pressure_col = None
+    for candidate in ["avg_dp_tubing", "avg_downhole_pressure", "avg_whp"]:
+        if candidate in df.columns and (df[candidate] > 0).any():
+            pressure_col = candidate
+            break
+    if pressure_col is None:
+        df["productivity_index"] = 0.0
+        df["dp_drawdown"] = 0.0
+        return df
+
+    train_mask = df["ds"] <= train_cutoff
+    p_ref = (
+        df.loc[train_mask & (df[pressure_col] > 0)]
+        .groupby("well")[pressure_col]
+        .quantile(0.95)
+    )
+    df["_p_ref"] = df["well"].map(p_ref)
+    dp = (df["_p_ref"] - df[pressure_col]).clip(lower=1.0)
+    df["productivity_index"] = (df["oil_vol"] / dp).fillna(0.0)
+    df["dp_drawdown"] = dp.fillna(0.0)
+    df = df.drop(columns=["_p_ref"])
+    logger.info("Computed productivity index from %s", pressure_col)
     return df
 
 
@@ -92,7 +210,12 @@ def _compute_field_injection(prod_df: pd.DataFrame, inj_df: pd.DataFrame) -> pd.
     return prod_df
 
 
+# ---------------------------------------------------------------------------
+# Reindex & imputation
+# ---------------------------------------------------------------------------
+
 def _reindex_daily(df: pd.DataFrame, wells: List[str]) -> pd.DataFrame:
+    """Reindex to continuous daily calendar with limited gap filling."""
     frames: List[pd.DataFrame] = []
     for well in wells:
         wd = df[df["well"] == well].set_index("ds").sort_index()
@@ -101,20 +224,40 @@ def _reindex_daily(df: pd.DataFrame, wells: List[str]) -> pd.DataFrame:
         idx = pd.date_range(wd.index.min(), wd.index.max(), freq="D")
         wd = wd.reindex(idx)
         wd["well"] = well
+        # Interpolate numeric columns for short gaps (<=3 days), leave longer as-is
+        numeric_cols = wd.select_dtypes(include=[np.number]).columns.tolist()
+        for col in numeric_cols:
+            wd[col] = wd[col].interpolate(method="linear", limit=3)
+        wd[numeric_cols] = wd[numeric_cols].ffill(limit=3).bfill(limit=1)
+        # Forward-fill non-numeric (type, etc.)
+        str_cols = [c for c in wd.columns if c not in numeric_cols and c != "well"]
+        for col in str_cols:
+            wd[col] = wd[col].ffill(limit=3)
         frames.append(wd.reset_index().rename(columns={"index": "ds"}))
     if not frames:
         return pd.DataFrame(columns=["ds", "well"])
-    return pd.concat(frames, ignore_index=True)
+    result = pd.concat(frames, ignore_index=True)
+    return result
 
+
+# ---------------------------------------------------------------------------
+# Well selection
+# ---------------------------------------------------------------------------
 
 def get_producer_wells(df: pd.DataFrame, config: VolveConfig) -> List[str]:
     last_type = df.sort_values("date").groupby("well").tail(1).set_index("well")["type"]
     producers = last_type[last_type == "PROD"].index.tolist()
-    counts = df[df["type"] == "PROD"].groupby("well").size()
+    # Count only active production days (on_stream > 0 or oil > 0)
+    active = df[(df["type"] == "PROD") & ((df["on_stream_hrs"] > 0) | (df["oil_vol"] > 0))]
+    counts = active.groupby("well").size()
     selected = [w for w in producers if counts.get(w, 0) >= config.min_history]
     logger.info("Selected %d producer wells: %s", len(selected), selected)
     return sorted(selected)
 
+
+# ---------------------------------------------------------------------------
+# Frame preparation
+# ---------------------------------------------------------------------------
 
 def prepare_volve_frames(
     raw_df: pd.DataFrame,
@@ -126,17 +269,23 @@ def prepare_volve_frames(
 
     prod_raw = raw_df[raw_df["well"].isin(producer_wells) & (raw_df["type"] == "PROD")].copy()
     prod_raw = prod_raw.rename(columns={"date": "ds"})
+
+    # Clean: remove shutdown days & trim permanent shutdowns
+    prod_raw = _filter_shutdown_days(prod_raw)
+    prod_raw = _trim_permanent_shutdown(prod_raw, min_tail_zeros=14)
+
     inj_raw = raw_df[raw_df["type"] == "INJ"].copy()
     inj_raw = inj_raw.rename(columns={"date": "ds"})
 
+    # Reindex to daily calendar with limited interpolation
     prod_df = _reindex_daily(prod_raw, producer_wells)
-    numeric_cols = [c for c in prod_df.columns if c not in {"ds", "well", "type", "well_raw", "well_type"}]
-    for col in numeric_cols:
-        if col in prod_df.columns:
-            prod_df[col] = prod_df.groupby("well")[col].transform(lambda s: s.ffill().bfill())
+    # Fill remaining NaN in numeric cols
+    numeric_cols = [c for c in prod_df.columns
+                    if c not in {"ds", "well", "type", "well_raw", "well_type"}]
     prod_df[numeric_cols] = prod_df[numeric_cols].fillna(0.0)
     prod_df["type"] = prod_df["type"].fillna("PROD")
 
+    # Features
     prod_df = _compute_production_features(prod_df)
 
     inj_daily = pd.DataFrame(columns=["ds", "well", "wi_vol"])
@@ -144,26 +293,36 @@ def prepare_volve_frames(
         inj_wells = sorted(inj_raw["well"].unique())
         inj_daily = _reindex_daily(inj_raw, inj_wells)
         inj_daily["wi_vol"] = inj_daily["wi_vol"].fillna(0.0)
-
     prod_df = _compute_field_injection(prod_df, inj_daily)
 
-    prod_df["unique_id"] = prod_df["well"]
-    prod_df["y"] = prod_df["oil_vol"].astype(float)
-    prod_df["time_idx"] = prod_df.sort_values("ds").groupby("well").cumcount()
-
-    # Train/test split
+    # Compute train_cutoff early for leakage-safe features
     max_dates = prod_df.groupby("well")["ds"].max()
     target_end = max_dates.min()
     test_start = target_end - pd.Timedelta(days=config.horizon - 1)
     train_cutoff = test_start - pd.Timedelta(days=1)
 
+    prod_df = _compute_rolling_features(prod_df)
+    prod_df = _compute_fourier_features(prod_df)
+    prod_df = _compute_productivity_index(prod_df, train_cutoff)
+
+    prod_df["unique_id"] = prod_df["well"]
+    prod_df["y"] = prod_df["oil_vol"].astype(float)
+    prod_df["time_idx"] = prod_df.sort_values("ds").groupby("well").cumcount()
+
+    # Fill any remaining NaN in feature columns
+    feature_cols = set(config.hist_exog + config.futr_exog)
+    for col in feature_cols:
+        if col in prod_df.columns and prod_df[col].isna().any():
+            prod_df[col] = prod_df[col].fillna(0.0)
+
+    # Train/test split
     train_df = prod_df[prod_df["ds"] < test_start].copy().sort_values(["unique_id", "ds"])
     test_df = prod_df[prod_df["ds"] >= test_start].copy().sort_values(["unique_id", "ds"])
 
     if train_df.empty or test_df.empty:
         raise ValueError("Train or test dataframe is empty after splitting.")
 
-    futr_df = test_df[["unique_id", "ds"] + config.futr_exog].copy()
+    futr_df = test_df[["unique_id", "ds"] + [c for c in config.futr_exog if c in test_df.columns]].copy()
 
     logger.info(
         "Prepared Volve daily frames: train=%d, test=%d, wells=%d, "
@@ -181,6 +340,10 @@ def prepare_volve_frames(
         "train_cutoff": train_cutoff,
     }
 
+
+# ---------------------------------------------------------------------------
+# XLinear model
+# ---------------------------------------------------------------------------
 
 def xlinear_predict(
     train_df: pd.DataFrame,
@@ -266,6 +429,7 @@ def xlinear_predict(
         if val_cols:
             forecasts = forecasts.rename(columns={val_cols[0]: "y_hat"})
 
+    forecasts["y_hat"] = forecasts["y_hat"].clip(lower=0.0)
     return forecasts[["unique_id", "ds", "y_hat"]]
 
 
@@ -277,6 +441,10 @@ def train_and_forecast(
     logger.info("Generated %d XLinear forecast rows", len(preds))
     return preds
 
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
 
 def evaluate_predictions(
     pred_df: pd.DataFrame,
@@ -355,6 +523,10 @@ def _compute_metrics(
         "mean_bias_error": mean_bias,
     }
 
+
+# ---------------------------------------------------------------------------
+# Walk-forward cross-validation
+# ---------------------------------------------------------------------------
 
 def generate_walk_forward_splits(
     train_df: pd.DataFrame,
