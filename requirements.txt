@@ -9,12 +9,17 @@ node2vec>=0.4.0
 # Deep Learning
 torch>=2.0.0
 pytorch-lightning>=2.0.0
+torch-geometric>=2.7.0
+torch-geometric-temporal>=0.56.2
+tsl>=0.9.1
+deepxde>=1.12.2
 
 # Time Series
 neuralforecast>=1.6.0
 darts>=0.30.0
 transformers>=4.38.0
 accelerate>=0.27.0
+dtaidistance>=2.3.12
 
 # Data Validation
 pandera>=0.17.0

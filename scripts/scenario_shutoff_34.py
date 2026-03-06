@@ -76,7 +76,7 @@ def _generate_scenario_pdf(
     wells_other = sorted([w for w in wells if w not in connected_prods])
     ordered_wells = wells_connected + wells_other
 
-    model_label = {"chronos2": "Chronos-2", "xlinear": "XLinear"}.get(model_name, model_name)
+    model_label = {"chronos2": "Chronos-2", "xlinear": "XLinear", "stgnn_pyg": "STGNN PyG"}.get(model_name, model_name)
 
     with PdfPages(pdf_path) as pdf:
         # --- Стр. 1: Сводная таблица ---
@@ -197,12 +197,17 @@ def _generate_scenario_pdf(
     logger.info("Scenario PDF saved to %s", pdf_path)
 
 
-def run_scenario(raw_df: pd.DataFrame, coords, config, distances, label: str):
+def run_scenario(raw_df: pd.DataFrame, coords, config, distances, label: str, *, scenario: dict | None = None, reuse_frames: dict | None = None):
     """Run full pipeline and return predictions + frames."""
     logger.info("=" * 60)
     logger.info("Running scenario: %s", label)
     logger.info("=" * 60)
-    frames = prepare_model_frames(raw_df, coords, config, distances=distances)
+    if reuse_frames is not None and config.model_type == "stgnn_pyg":
+        frames = deepcopy(reuse_frames)
+    else:
+        frames = prepare_model_frames(raw_df, coords, config, distances=distances)
+    if scenario:
+        frames["scenario"] = dict(scenario)
     preds = train_and_forecast(frames, config)
     metrics, merged = evaluate_predictions(
         preds, frames["test_df"], frames["train_df"],
@@ -213,10 +218,15 @@ def run_scenario(raw_df: pd.DataFrame, coords, config, distances, label: str):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="chronos2", choices=["chronos2", "xlinear"])
+    parser.add_argument("--model", default="chronos2", choices=["chronos2", "xlinear", "stgnn_pyg"])
     args = parser.parse_args()
 
-    base_artifacts = Path("artifacts_xlinear") if args.model == "xlinear" else Path("artifacts")
+    if args.model == "xlinear":
+        base_artifacts = Path("artifacts_xlinear")
+    elif args.model == "stgnn_pyg":
+        base_artifacts = Path("artifacts_stgnn_pyg")
+    else:
+        base_artifacts = Path("artifacts")
     out_dir = base_artifacts / "scenario_shutoff_34"
     out_dir.mkdir(parents=True, exist_ok=True)
     config = PipelineConfig(model_type=args.model)
@@ -230,35 +240,47 @@ def main():
         raw_df, coords, config, distances, "BASELINE (all injectors active)"
     )
 
-    # --- Shutoff: zero WWIR for well 34 from 2021-01 ---
-    raw_shutoff = raw_df.copy()
-    mask = (
-        (raw_shutoff["well"] == SHUTOFF_WELL)
-        & (raw_shutoff["date"] >= SHUTOFF_DATE)
-        & (raw_shutoff["type"] == "INJ")
-    )
-    n_zeroed = mask.sum()
-    logger.info(
-        "Zeroing WWIR for well %s from %s: %d rows affected",
-        SHUTOFF_WELL, SHUTOFF_DATE.date(), n_zeroed,
-    )
-    raw_shutoff.loc[mask, "wwir"] = 0.0
-    raw_shutoff.loc[mask, "wwit_diff"] = 0.0
-    # Freeze cumulative injection at the value just before shutoff
-    if n_zeroed > 0:
-        pre_shutoff = raw_shutoff[
+    scenario = {
+        "type": "injector_shutoff",
+        "well": SHUTOFF_WELL,
+        "date": str(SHUTOFF_DATE.date()),
+    }
+    if args.model == "stgnn_pyg":
+        frames_shut, preds_shut, metrics_shut, merged_shut = run_scenario(
+            raw_df, coords, config, distances,
+            f"GRAPH-EDIT shutoff well {SHUTOFF_WELL} from {SHUTOFF_DATE.date()}",
+            scenario=scenario,
+            reuse_frames=frames_base,
+        )
+    else:
+        # --- Baseline covariate-only shutoff: zero WWIR for well 34 from 2021-01 ---
+        raw_shutoff = raw_df.copy()
+        mask = (
             (raw_shutoff["well"] == SHUTOFF_WELL)
-            & (raw_shutoff["date"] < SHUTOFF_DATE)
+            & (raw_shutoff["date"] >= SHUTOFF_DATE)
             & (raw_shutoff["type"] == "INJ")
-        ]
-        if not pre_shutoff.empty:
-            frozen_wwit = pre_shutoff.sort_values("date").iloc[-1]["wwit"]
-            raw_shutoff.loc[mask, "wwit"] = frozen_wwit
+        )
+        n_zeroed = mask.sum()
+        logger.info(
+            "Zeroing WWIR for well %s from %s: %d rows affected",
+            SHUTOFF_WELL, SHUTOFF_DATE.date(), n_zeroed,
+        )
+        raw_shutoff.loc[mask, "wwir"] = 0.0
+        raw_shutoff.loc[mask, "wwit_diff"] = 0.0
+        if n_zeroed > 0:
+            pre_shutoff = raw_shutoff[
+                (raw_shutoff["well"] == SHUTOFF_WELL)
+                & (raw_shutoff["date"] < SHUTOFF_DATE)
+                & (raw_shutoff["type"] == "INJ")
+            ]
+            if not pre_shutoff.empty:
+                frozen_wwit = pre_shutoff.sort_values("date").iloc[-1]["wwit"]
+                raw_shutoff.loc[mask, "wwit"] = frozen_wwit
 
-    frames_shut, preds_shut, metrics_shut, merged_shut = run_scenario(
-        raw_shutoff, coords, config, distances,
-        f"SHUTOFF well {SHUTOFF_WELL} from {SHUTOFF_DATE.date()}"
-    )
+        frames_shut, preds_shut, metrics_shut, merged_shut = run_scenario(
+            raw_shutoff, coords, config, distances,
+            f"SHUTOFF well {SHUTOFF_WELL} from {SHUTOFF_DATE.date()}"
+        )
 
     # --- Compare ---
     test_start = frames_base["test_start"]

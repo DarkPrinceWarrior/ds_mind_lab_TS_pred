@@ -53,6 +53,129 @@ class PairLagSummary:
 SUMMARY_COLUMNS = [field.name for field in fields(PairLagSummary)]
 
 
+def _empty_graph_edge_static() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "prod_id", "inj_id", "distance_m", "metric_distance_m",
+            "kernel_weight", "crm_weight", "corr", "lag", "tau",
+            "attn_alpha_train_mean", "attn_alpha_train_last",
+            "attn_alpha_full_last", "regime_labels",
+        ]
+    )
+
+
+def _build_graph_edge_static(summary_df: pd.DataFrame) -> pd.DataFrame:
+    if summary_df is None or summary_df.empty:
+        return _empty_graph_edge_static()
+    edge_static = summary_df.copy()
+    if "kernel_weight" not in edge_static.columns:
+        edge_static["kernel_weight"] = pd.to_numeric(edge_static.get("weight", 0.0), errors="coerce").fillna(0.0)
+    if "crm_weight" not in edge_static.columns:
+        preferred = pd.to_numeric(edge_static.get("attn_alpha_train_mean"), errors="coerce")
+        fallback = pd.to_numeric(edge_static.get("attn_alpha"), errors="coerce")
+        edge_static["crm_weight"] = preferred.where(preferred.notna(), fallback).fillna(edge_static["kernel_weight"])
+    regime_source = None
+    for candidate in ["regime_labels", "regime_id", "stage_id"]:
+        if candidate in edge_static.columns:
+            regime_source = edge_static[candidate].astype(str)
+            break
+    if regime_source is None:
+        regime_source = pd.Series([""] * len(edge_static), index=edge_static.index, dtype=object)
+    edge_static["regime_labels"] = regime_source
+    keep_cols = [
+        "prod_id", "inj_id", "distance_m", "metric_distance_m",
+        "kernel_weight", "crm_weight", "corr", "lag", "tau",
+        "attn_alpha_train_mean", "attn_alpha_train_last",
+        "attn_alpha_full_last", "regime_labels",
+    ]
+    for col in keep_cols:
+        if col not in edge_static.columns:
+            edge_static[col] = np.nan if col not in {"prod_id", "inj_id", "regime_labels"} else ""
+    return edge_static[keep_cols].sort_values(["prod_id", "inj_id"]).reset_index(drop=True)
+
+
+def _build_graph_edge_temporal(
+    summary_df: pd.DataFrame,
+    alpha_timeseries: pd.DataFrame,
+    full_index: pd.Index,
+    train_mask: pd.Index | pd.Series | np.ndarray,
+    inj_rate: pd.DataFrame,
+    inj_wwit_diff: pd.DataFrame,
+    pair_details: Dict[Tuple[str, str], Dict[str, float]],
+    *,
+    use_crm: bool,
+) -> pd.DataFrame:
+    if summary_df is None or summary_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "ds", "prod_id", "inj_id", "alpha_t", "lagged_rate_t",
+                "crm_rate_t", "lagged_wwit_diff_t", "contribution_t",
+                "regime_id", "stage_id", "is_train",
+            ]
+        )
+    if isinstance(train_mask, (pd.Series, pd.Index)):
+        is_train_map = pd.Series(np.asarray(train_mask, dtype=bool), index=full_index)
+    else:
+        is_train_map = pd.Series(np.asarray(train_mask, dtype=bool), index=full_index)
+
+    alpha_lookup: Dict[Tuple[pd.Timestamp, str, str], Dict[str, float]] = {}
+    if alpha_timeseries is not None and not alpha_timeseries.empty:
+        dyn = alpha_timeseries.copy()
+        dyn["ds"] = pd.to_datetime(dyn["ds"])
+        dyn["prod_id"] = dyn["prod_id"].astype(str)
+        dyn["inj_id"] = dyn["inj_id"].astype(str)
+        for row in dyn.itertuples(index=False):
+            alpha_lookup[(pd.Timestamp(row.ds), str(row.prod_id), str(row.inj_id))] = {
+                "alpha_t": float(getattr(row, "alpha", 0.0)),
+                "regime_id": getattr(row, "regime_id", None),
+                "stage_id": getattr(row, "stage_id", None),
+                "is_train": bool(getattr(row, "is_train", False)),
+            }
+
+    records: List[Dict[str, Any]] = []
+    for row in summary_df.itertuples(index=False):
+        prod_id = str(row.prod_id)
+        inj_id = str(row.inj_id)
+        info = pair_details.get((prod_id, inj_id), {})
+        lag = int(info.get("lag", getattr(row, "lag", 0)))
+        tau = float(info.get("tau", getattr(row, "tau", 1.0)))
+        kernel_weight = float(getattr(row, "weight", getattr(row, "kernel_weight", 0.0)))
+        inj_series = inj_rate[inj_id].reindex(full_index).fillna(0.0) if inj_id in inj_rate.columns else pd.Series(0.0, index=full_index)
+        lagged_rate = inj_series.shift(lag).fillna(0.0)
+        lagged_diff = (
+            inj_wwit_diff[inj_id].reindex(full_index).shift(lag).fillna(0.0)
+            if inj_id in inj_wwit_diff.columns
+            else pd.Series(0.0, index=full_index)
+        )
+        crm_rate = crm_exp_filter(inj_series, tau=tau, delta=1.0).reindex(full_index).fillna(0.0) if use_crm else pd.Series(0.0, index=full_index)
+        for ds in full_index:
+            key = (pd.Timestamp(ds), prod_id, inj_id)
+            dyn = alpha_lookup.get(key, {})
+            alpha_t = float(dyn.get("alpha_t", kernel_weight))
+            regime_id = dyn.get("regime_id")
+            stage_id = dyn.get("stage_id")
+            is_train = bool(dyn.get("is_train", bool(is_train_map.loc[ds])))
+            lagged_rate_t = float(lagged_rate.loc[ds])
+            crm_rate_t = float(crm_rate.loc[ds]) if use_crm else 0.0
+            lagged_diff_t = float(lagged_diff.loc[ds])
+            records.append(
+                {
+                    "ds": pd.Timestamp(ds),
+                    "prod_id": prod_id,
+                    "inj_id": inj_id,
+                    "alpha_t": alpha_t,
+                    "lagged_rate_t": lagged_rate_t,
+                    "crm_rate_t": crm_rate_t,
+                    "lagged_wwit_diff_t": lagged_diff_t,
+                    "contribution_t": alpha_t * lagged_rate_t,
+                    "regime_id": regime_id,
+                    "stage_id": stage_id,
+                    "is_train": is_train,
+                }
+            )
+    return pd.DataFrame.from_records(records).sort_values(["ds", "prod_id", "inj_id"]).reset_index(drop=True)
+
+
 def _normalize_well_id(value: object) -> str:
     if isinstance(value, str):
         return value.strip()
@@ -1540,6 +1663,7 @@ def build_injection_lag_features(
     if not summary_df.empty:
         summary_df = summary_df.sort_values(["prod_id", "lag", "inj_id"])
         summary_df = summary_df.reset_index(drop=True)
+        summary_df["kernel_weight"] = pd.to_numeric(summary_df.get("weight"), errors="coerce").fillna(0.0)
         if use_attention and attn_weight_map:
             pair_keys = list(zip(summary_df["prod_id"].astype(str), summary_df["inj_id"].astype(str)))
             attn_lookup = {
@@ -1577,7 +1701,37 @@ def build_injection_lag_features(
                     summary_df["attn_alpha"],
                 )
                 summary_df["attn_minus_kernel"] = summary_df["attn_alpha"] - summary_df["weight"]
+        if "crm_weight" not in summary_df.columns:
+            preferred = pd.to_numeric(summary_df.get("attn_alpha_train_mean"), errors="coerce")
+            fallback = pd.to_numeric(summary_df.get("attn_alpha"), errors="coerce")
+            summary_df["crm_weight"] = preferred.where(preferred.notna(), fallback).fillna(summary_df["kernel_weight"])
+        if use_attention and not alpha_timeseries.empty and {"prod_id", "inj_id", "regime_id"} <= set(alpha_timeseries.columns):
+            regime_labels = (
+                alpha_timeseries.assign(
+                    prod_id=alpha_timeseries["prod_id"].astype(str),
+                    inj_id=alpha_timeseries["inj_id"].astype(str),
+                    regime_id=alpha_timeseries["regime_id"].astype(str),
+                )
+                .groupby(["prod_id", "inj_id"])["regime_id"]
+                .agg(lambda values: "|".join(sorted({value for value in values if value and value != "nan"})))
+            )
+            regime_lookup = {(prod_id, inj_id): value for (prod_id, inj_id), value in regime_labels.items()}
+            pair_keys = list(zip(summary_df["prod_id"].astype(str), summary_df["inj_id"].astype(str)))
+            summary_df["regime_labels"] = [regime_lookup.get((prod_id, inj_id), "") for prod_id, inj_id in pair_keys]
     summary_df.attrs["attention_mode"] = ATTENTION_METHOD_CAUSAL_STAGE_GEO
     if use_attention and not alpha_timeseries.empty:
         summary_df.attrs["attention_alpha_timeseries"] = alpha_timeseries
+    graph_edge_static = _build_graph_edge_static(summary_df)
+    graph_edge_temporal = _build_graph_edge_temporal(
+        summary_df,
+        alpha_timeseries,
+        full_index,
+        train_mask,
+        inj_rate,
+        inj_wwit_diff,
+        pair_details,
+        use_crm=use_crm,
+    )
+    summary_df.attrs["graph_edge_static"] = graph_edge_static
+    summary_df.attrs["graph_edge_temporal"] = graph_edge_temporal
     return features, summary_df

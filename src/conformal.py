@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -69,12 +69,52 @@ def _compute_eps(errors: np.ndarray, alpha: float, method: str, decay: float) ->
         return float("nan")
     q = float(np.clip(1.0 - alpha, 0.0, 1.0))
     if method == "icp":
-        # Split conformal finite-sample quantile: ceil((n+1)*(1-alpha))/n.
         level = np.ceil((len(errors) + 1) * q) / max(len(errors), 1)
         level = float(np.clip(level, 0.0, 1.0))
         return _finite_sample_quantile(errors, level)
     weights = _build_weights(len(errors), method, decay)
     return _weighted_quantile(errors, weights, q)
+
+
+def _build_group_key(frame: pd.DataFrame, cols: List[str]) -> pd.Series:
+    safe = frame[cols].copy()
+    for col in cols:
+        safe[col] = safe[col].fillna("__nan__").astype(str)
+    return safe.agg("|".join, axis=1)
+
+
+def _compute_profile_block(
+    work: pd.DataFrame,
+    *,
+    horizon: int,
+    alpha: float,
+    method: str,
+    exp_decay: float,
+    min_samples: int,
+    per_horizon: bool,
+) -> Dict[str, Any]:
+    all_errors = work["abs_err"].to_numpy(dtype=float)
+    global_eps = _compute_eps(all_errors, alpha=alpha, method=method, decay=exp_decay)
+    eps_by_h: Dict[str, float] = {}
+    samples_by_h: Dict[str, int] = {}
+    source_by_h: Dict[str, str] = {}
+    for h in range(1, horizon + 1):
+        h_errors = work.loc[work["h_step"] == h, "abs_err"].to_numpy(dtype=float)
+        h_count = int(h_errors.size)
+        samples_by_h[str(h)] = h_count
+        if per_horizon and h_count >= min_samples:
+            eps_by_h[str(h)] = float(_compute_eps(h_errors, alpha=alpha, method=method, decay=exp_decay))
+            source_by_h[str(h)] = "per_horizon"
+        else:
+            eps_by_h[str(h)] = float(global_eps)
+            source_by_h[str(h)] = "global_fallback"
+    return {
+        "global_eps": float(global_eps),
+        "global_samples": int(len(all_errors)),
+        "eps_by_horizon": eps_by_h,
+        "samples_by_horizon": samples_by_h,
+        "source_by_horizon": source_by_h,
+    }
 
 
 def compute_conformal_profile(
@@ -85,11 +125,8 @@ def compute_conformal_profile(
     per_horizon: bool = True,
     exp_decay: float = 0.97,
     min_samples: int = 30,
+    group_levels: Optional[Dict[str, List[str]]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Build conformal calibration profile from out-of-sample residuals.
-
-    Expected columns: `abs_err`, optionally `h_step`, `ds`, `calib_order`.
-    """
     if residuals_df is None or residuals_df.empty or "abs_err" not in residuals_df.columns:
         logger.warning("Conformal calibration skipped: empty residual pool.")
         return None
@@ -118,27 +155,42 @@ def compute_conformal_profile(
         work["h_step"] = pd.to_numeric(work["h_step"], errors="coerce")
     else:
         work["h_step"] = np.nan
+    work["h_step"] = work["h_step"].fillna(1).clip(lower=1, upper=horizon).astype(int)
 
-    all_errors = work["abs_err"].to_numpy(dtype=float)
-    global_eps = _compute_eps(all_errors, alpha=alpha, method=method_resolved, decay=exp_decay)
+    base_block = _compute_profile_block(
+        work,
+        horizon=horizon,
+        alpha=alpha,
+        method=method_resolved,
+        exp_decay=exp_decay,
+        min_samples=min_samples,
+        per_horizon=per_horizon,
+    )
 
-    eps_by_h: Dict[str, float] = {}
-    samples_by_h: Dict[str, int] = {}
-    source_by_h: Dict[str, str] = {}
-
-    for h in range(1, horizon + 1):
-        h_mask = work["h_step"] == h
-        h_errors = work.loc[h_mask, "abs_err"].to_numpy(dtype=float)
-        h_count = int(h_errors.size)
-        samples_by_h[str(h)] = h_count
-
-        if per_horizon and h_count >= min_samples:
-            eps = _compute_eps(h_errors, alpha=alpha, method=method_resolved, decay=exp_decay)
-            source_by_h[str(h)] = "per_horizon"
-        else:
-            eps = global_eps
-            source_by_h[str(h)] = "global_fallback"
-        eps_by_h[str(h)] = float(eps)
+    grouped_profiles: Dict[str, Dict[str, Any]] = {}
+    active_group_levels: Dict[str, List[str]] = {}
+    for level_name, cols in dict(group_levels or {}).items():
+        usable_cols = [col for col in cols if col in work.columns]
+        if len(usable_cols) != len(cols):
+            continue
+        group_key = _build_group_key(work, usable_cols)
+        block_map: Dict[str, Any] = {}
+        grouped = work.assign(_group_key=group_key)
+        for group_value, group_frame in grouped.groupby("_group_key"):
+            if len(group_frame) < min_samples:
+                continue
+            block_map[str(group_value)] = _compute_profile_block(
+                group_frame.drop(columns="_group_key"),
+                horizon=horizon,
+                alpha=alpha,
+                method=method_resolved,
+                exp_decay=exp_decay,
+                min_samples=min_samples,
+                per_horizon=per_horizon,
+            )
+        if block_map:
+            grouped_profiles[level_name] = block_map
+            active_group_levels[level_name] = usable_cols
 
     profile: Dict[str, Any] = {
         "enabled": True,
@@ -148,13 +200,42 @@ def compute_conformal_profile(
         "per_horizon": bool(per_horizon),
         "exp_decay": float(exp_decay),
         "min_samples": min_samples,
-        "global_eps": float(global_eps),
-        "global_samples": int(len(all_errors)),
-        "eps_by_horizon": eps_by_h,
-        "samples_by_horizon": samples_by_h,
-        "source_by_horizon": source_by_h,
+        "global_eps": base_block["global_eps"],
+        "global_samples": base_block["global_samples"],
+        "eps_by_horizon": base_block["eps_by_horizon"],
+        "samples_by_horizon": base_block["samples_by_horizon"],
+        "source_by_horizon": base_block["source_by_horizon"],
+        "group_levels": active_group_levels,
+        "grouped_profiles": grouped_profiles,
+        "fallback_order": list(active_group_levels.keys()),
     }
     return profile
+
+
+def _lookup_grouped_eps(row: pd.Series, profile: Dict[str, Any]) -> tuple[Optional[float], Optional[str]]:
+    grouped_profiles = dict(profile.get("grouped_profiles", {}))
+    if not grouped_profiles:
+        return None, None
+    fallback_order = list(profile.get("fallback_order", []))
+    group_levels = dict(profile.get("group_levels", {}))
+    h_step = int(row.get("h_step", 1))
+    for level_name in fallback_order:
+        cols = group_levels.get(level_name, [])
+        if not cols or not all(col in row.index for col in cols):
+            continue
+        if any(pd.isna(row[col]) for col in cols):
+            continue
+        key = "|".join(str(row[col]) for col in cols)
+        group_profile = grouped_profiles.get(level_name, {}).get(key)
+        if not group_profile:
+            continue
+        eps = group_profile.get("eps_by_horizon", {}).get(str(h_step))
+        if eps is None:
+            eps = group_profile.get("global_eps")
+        if eps is not None and np.isfinite(float(eps)):
+            source = group_profile.get("source_by_horizon", {}).get(str(h_step), "group_global_fallback")
+            return float(eps), f"group:{level_name}:{source}"
+    return None, None
 
 
 def apply_conformal_intervals(
@@ -186,8 +267,14 @@ def apply_conformal_intervals(
     src_map = {int(k): str(v) for k, v in src_map_raw.items()}
     global_eps = float(profile.get("global_eps", 0.0))
 
-    out["cp_eps"] = out["h_step"].map(eps_map).fillna(global_eps).astype(float)
-    out["cp_source"] = out["h_step"].map(src_map).fillna("global_fallback")
+    base_eps = out["h_step"].map(eps_map).fillna(global_eps).astype(float)
+    base_src = out["h_step"].map(src_map).fillna("global_fallback")
+    grouped_values = out.apply(lambda row: _lookup_grouped_eps(row, profile), axis=1)
+    grouped_eps = pd.Series([item[0] for item in grouped_values], index=out.index, dtype=float)
+    grouped_src = pd.Series([item[1] for item in grouped_values], index=out.index, dtype=object)
+
+    out["cp_eps"] = grouped_eps.where(grouped_eps.notna(), base_eps)
+    out["cp_source"] = grouped_src.where(grouped_src.notna(), base_src)
     out["cp_lo"] = out["y_hat"].astype(float) - out["cp_eps"]
     out["cp_hi"] = out["y_hat"].astype(float) + out["cp_eps"]
     out["cp_alpha"] = float(profile.get("alpha", np.nan))

@@ -423,3 +423,53 @@ def compute_all_reservoir_metrics(
         k: float(v) if isinstance(v, (int, float, np.floating)) and np.isfinite(v) else None
         for k, v in all_metrics.items()
     }
+
+
+def compute_intervention_response_metrics(
+    merged: pd.DataFrame,
+) -> Dict[str, Optional[float]]:
+    if merged is None or merged.empty or not {"unique_id", "y", "y_hat"}.issubset(merged.columns):
+        return {
+            "event_window_error": None,
+            "scenario_direction_accuracy": None,
+            "response_rank_accuracy": None,
+            "connectivity_consistency_score": None,
+        }
+
+    metrics: Dict[str, Optional[float]] = {}
+    if "event_window_flag" in merged.columns:
+        mask = pd.to_numeric(merged["event_window_flag"], errors="coerce").fillna(0).astype(bool)
+        metrics["event_window_error"] = float(np.mean(np.abs(merged.loc[mask, "y"] - merged.loc[mask, "y_hat"]))) if mask.any() else None
+    else:
+        metrics["event_window_error"] = None
+
+    if {"y_hat_baseline", "y_hat_shutoff"}.issubset(merged.columns):
+        pred_delta = merged["y_hat_shutoff"].to_numpy(dtype=float) - merged["y_hat_baseline"].to_numpy(dtype=float)
+        true_delta = merged["y"].to_numpy(dtype=float) - merged["y_hat_baseline"].to_numpy(dtype=float)
+        metrics["scenario_direction_accuracy"] = float(np.mean((np.sign(pred_delta) == np.sign(true_delta)).astype(float)))
+    else:
+        metrics["scenario_direction_accuracy"] = None
+
+    rank_true = merged.groupby("unique_id")["y"].sum()
+    rank_pred = merged.groupby("unique_id")["y_hat"].sum()
+    aligned = rank_true.to_frame("true").join(rank_pred.to_frame("pred"), how="inner")
+    if len(aligned) >= 2:
+        metrics["response_rank_accuracy"] = float(stats.spearmanr(aligned["true"], aligned["pred"]).correlation)
+    else:
+        metrics["response_rank_accuracy"] = None
+
+    if "crm_max_connectivity" in merged.columns:
+        response = merged.groupby("unique_id")["y_hat"].mean()
+        connectivity = merged.groupby("unique_id")["crm_max_connectivity"].mean()
+        aligned_conn = response.to_frame("response").join(connectivity.to_frame("connectivity"), how="inner")
+        if len(aligned_conn) >= 2:
+            metrics["connectivity_consistency_score"] = float(stats.spearmanr(aligned_conn["response"], aligned_conn["connectivity"]).correlation)
+        else:
+            metrics["connectivity_consistency_score"] = None
+    else:
+        metrics["connectivity_consistency_score"] = None
+
+    return {
+        key: float(value) if isinstance(value, (int, float, np.floating)) and np.isfinite(value) else None
+        for key, value in metrics.items()
+    }

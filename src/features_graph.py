@@ -9,6 +9,7 @@ Builds graph representations of the well network and computes:
 
 from __future__ import annotations
 
+from copy import deepcopy
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -589,6 +590,19 @@ def build_graph_features(
         (enriched_prod_df, static_graph_df) where static_graph_df contains
         per-well graph features for use as tiled covariates.
     """
+    prod_df = prod_df.copy()
+    well_col = "well" if "well" in prod_df.columns else "unique_id"
+    for source_col in ["wlpr", "womr"]:
+        if source_col in prod_df.columns:
+            diff_col = f"{source_col}_diff1"
+            cumsum_col = f"{source_col}_cumsum1"
+            if diff_col not in prod_df.columns:
+                prod_df[diff_col] = prod_df.groupby(well_col)[source_col].diff().fillna(0.0)
+            if cumsum_col not in prod_df.columns:
+                prod_df[cumsum_col] = prod_df.groupby(well_col)[source_col].cumsum().fillna(0.0)
+    if "productivity_index" in prod_df.columns and "pseudo_productivity_index" not in prod_df.columns:
+        prod_df["pseudo_productivity_index"] = prod_df["productivity_index"]
+
     G = build_well_graph(coords, distances=distances, well_types=well_types)
 
     # Centrality & embeddings use the full (dense) graph
@@ -608,8 +622,6 @@ def build_graph_features(
         scaler = StandardScaler()
         static_df[embed_cols] = scaler.fit_transform(static_df[embed_cols])
 
-    prod_df = prod_df.copy()
-    well_col = "well" if "well" in prod_df.columns else "unique_id"
     static_cols = [c for c in static_df.columns if c != "well"]
     for col in static_cols:
         mapping = static_df.set_index("well")[col].to_dict()
@@ -653,3 +665,418 @@ def build_graph_features(
         len(static_cols), len(neighbor_agg_cols or []), len(dtw_agg_cols or []),
     )
     return prod_df, static_df
+
+
+def _safe_numeric_frame(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in columns:
+        if col not in out.columns:
+            out[col] = 0.0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    return out
+
+
+def _series_to_matrix(
+    df: pd.DataFrame,
+    entity_col: str,
+    entities: List[str],
+    feature_cols: List[str],
+    dates: List[pd.Timestamp],
+) -> Dict[pd.Timestamp, np.ndarray]:
+    if not feature_cols:
+        return {pd.Timestamp(ds): np.zeros((len(entities), 0), dtype=float) for ds in dates}
+    work = df.copy()
+    work[entity_col] = work[entity_col].astype(str)
+    work["ds"] = pd.to_datetime(work["ds"])
+    work = _safe_numeric_frame(work, feature_cols)
+    matrices: Dict[pd.Timestamp, np.ndarray] = {}
+    for ds in dates:
+        snap = work[work["ds"] == pd.Timestamp(ds)].set_index(entity_col)
+        rows: List[np.ndarray] = []
+        for entity in entities:
+            if entity in snap.index:
+                values = snap.loc[entity, feature_cols]
+                if isinstance(values, pd.DataFrame):
+                    values = values.iloc[0]
+                rows.append(values.to_numpy(dtype=float))
+            else:
+                rows.append(np.zeros(len(feature_cols), dtype=float))
+        matrices[pd.Timestamp(ds)] = np.vstack(rows) if rows else np.zeros((0, len(feature_cols)), dtype=float)
+    return matrices
+
+
+def _coords_static_features(coords: pd.DataFrame, wells: List[str]) -> pd.DataFrame:
+    coords_frame = coords.copy()
+    coords_frame["well"] = coords_frame["well"].astype(str)
+    coords_frame = coords_frame.rename(columns={"x": "coord_x", "y": "coord_y", "z": "coord_z"})
+    for col in ["coord_x", "coord_y", "coord_z"]:
+        if col not in coords_frame.columns:
+            coords_frame[col] = 0.0
+    center = coords_frame[["coord_x", "coord_y", "coord_z"]].mean()
+    coords_frame["dist_from_center"] = np.sqrt(
+        (coords_frame["coord_x"] - center["coord_x"]) ** 2
+        + (coords_frame["coord_y"] - center["coord_y"]) ** 2
+        + (coords_frame["coord_z"] - center["coord_z"]) ** 2
+    )
+    return coords_frame[coords_frame["well"].isin(wells)].drop_duplicates("well")
+
+
+def _build_topology_edges(
+    coords: pd.DataFrame,
+    producer_ids: List[str],
+    *,
+    distances: Optional[pd.DataFrame] = None,
+    top_k: int = 4,
+) -> Tuple[
+    Dict[Tuple[str, str, str], np.ndarray],
+    Dict[pd.Timestamp, Dict[Tuple[str, str, str], np.ndarray]],
+    List[str],
+    Dict[Tuple[str, str, str], np.ndarray],
+]:
+    if not producer_ids:
+        return {}, {}, ["distance_m", "proximity"], {}
+    topo_coords = _coords_static_features(coords, producer_ids).set_index("well")
+    dist_frame: Optional[pd.DataFrame] = None
+    if distances is not None and not distances.empty:
+        dist_frame = distances.copy()
+        dist_frame.index = dist_frame.index.astype(str)
+        dist_frame.columns = dist_frame.columns.astype(str)
+    src_nodes: List[int] = []
+    dst_nodes: List[int] = []
+    attrs: List[List[float]] = []
+    for i, src in enumerate(producer_ids):
+        candidates: List[Tuple[str, float]] = []
+        for dst in producer_ids:
+            if src == dst:
+                continue
+            if dist_frame is not None and src in dist_frame.index and dst in dist_frame.columns:
+                distance_val = float(dist_frame.loc[src, dst])
+            else:
+                if src not in topo_coords.index or dst not in topo_coords.index:
+                    distance_val = np.nan
+                else:
+                    delta = topo_coords.loc[src, ["coord_x", "coord_y", "coord_z"]].to_numpy(dtype=float) - topo_coords.loc[dst, ["coord_x", "coord_y", "coord_z"]].to_numpy(dtype=float)
+                    distance_val = float(np.linalg.norm(delta))
+            if not np.isfinite(distance_val) or distance_val <= 0:
+                continue
+            candidates.append((dst, distance_val))
+        candidates.sort(key=lambda item: item[1])
+        for dst, distance_val in candidates[:max(int(top_k), 1)]:
+            src_nodes.append(i)
+            dst_nodes.append(producer_ids.index(dst))
+            attrs.append([distance_val, 1.0 / max(distance_val, 1e-6)])
+    edge_index = np.asarray([src_nodes, dst_nodes], dtype=np.int64) if src_nodes else np.zeros((2, 0), dtype=np.int64)
+    edge_attr = np.asarray(attrs, dtype=float) if attrs else np.zeros((0, 2), dtype=float)
+    edge_type = ("producer", "topo", "producer")
+    return {edge_type: edge_index}, {}, ["distance_m", "proximity"], {edge_type: edge_attr}
+
+
+def build_multigraph_spec(
+    prod_df: pd.DataFrame,
+    inj_df: pd.DataFrame,
+    pair_table: pd.DataFrame,
+    coords: pd.DataFrame,
+    distances: Optional[pd.DataFrame],
+    config: Any,
+) -> Dict[str, Any]:
+    prod_frame = prod_df.copy()
+    inj_frame = inj_df.copy()
+    prod_frame["well"] = prod_frame["well"].astype(str)
+    prod_frame["ds"] = pd.to_datetime(prod_frame["ds"])
+    inj_frame["well"] = inj_frame["well"].astype(str)
+    inj_frame["ds"] = pd.to_datetime(inj_frame["ds"])
+
+    for source_col in ["wlpr", "womr"]:
+        if source_col in prod_frame.columns:
+            diff_col = f"{source_col}_diff1"
+            cumsum_col = f"{source_col}_cumsum1"
+            if diff_col not in prod_frame.columns:
+                prod_frame[diff_col] = prod_frame.groupby("well")[source_col].diff().fillna(0.0)
+            if cumsum_col not in prod_frame.columns:
+                prod_frame[cumsum_col] = prod_frame.groupby("well")[source_col].cumsum().fillna(0.0)
+    if "productivity_index" in prod_frame.columns and "pseudo_productivity_index" not in prod_frame.columns:
+        prod_frame["pseudo_productivity_index"] = prod_frame["productivity_index"]
+    if "wwir" in inj_frame.columns:
+        if "wwir_diff1" not in inj_frame.columns:
+            inj_frame["wwir_diff1"] = inj_frame.groupby("well")["wwir"].diff().fillna(0.0)
+        if "wwir_cumsum1" not in inj_frame.columns:
+            inj_frame["wwir_cumsum1"] = inj_frame.groupby("well")["wwir"].cumsum().fillna(0.0)
+
+    producer_ids = sorted(prod_frame["well"].astype(str).unique())
+    injector_ids = sorted(inj_frame["well"].astype(str).unique())
+    dates = sorted(pd.to_datetime(prod_frame["ds"]).unique())
+    graph_types = [graph_type for graph_type in config.resolved_graph_types() if graph_type in {"topo", "bin", "cond", "dyn", "causal"}]
+    pair_attrs = dict(getattr(pair_table, "attrs", {})) if pair_table is not None else {}
+    pair_table = pair_table.copy() if pair_table is not None else pd.DataFrame()
+    if pair_attrs:
+        pair_table.attrs.update(pair_attrs)
+    if not pair_table.empty:
+        pair_table["prod_id"] = pair_table["prod_id"].astype(str)
+        pair_table["inj_id"] = pair_table["inj_id"].astype(str)
+
+    producer_static_cols = [col for col in config.static_exog if col in prod_frame.columns]
+    producer_static = (
+        prod_frame.groupby("well")[producer_static_cols].first().reindex(producer_ids).fillna(0.0)
+        if producer_static_cols
+        else pd.DataFrame(index=producer_ids)
+    )
+    injector_static_base = _coords_static_features(coords, injector_ids).set_index("well").reindex(injector_ids)
+    injector_static = injector_static_base.fillna(0.0)
+
+    producer_feature_cols = [col for col in config.resolved_stgnn_feature_columns()["producer"] if col in prod_frame.columns]
+    injector_feature_cols = [col for col in config.resolved_stgnn_feature_columns()["injector"] if col in inj_frame.columns]
+    producer_dynamic = _series_to_matrix(prod_frame, "well", producer_ids, producer_feature_cols, dates)
+    injector_dynamic = _series_to_matrix(inj_frame, "well", injector_ids, injector_feature_cols, dates)
+
+    cluster_map: Dict[str, int] = {}
+    if "prod_cluster" in prod_frame.columns:
+        cluster_map = (
+            prod_frame[["well", "prod_cluster"]]
+            .drop_duplicates("well")
+            .set_index("well")["prod_cluster"]
+            .fillna(-1)
+            .astype(int)
+            .to_dict()
+        )
+
+    edge_index_dict_by_graph: Dict[str, Dict[Tuple[str, str, str], np.ndarray]] = {}
+    edge_attr_dict_by_graph_and_time: Dict[str, Dict[pd.Timestamp, Dict[Tuple[str, str, str], np.ndarray]]] = {}
+    edge_feature_names: Dict[str, List[str]] = {}
+    edge_static_attrs: Dict[str, Dict[Tuple[str, str, str], np.ndarray]] = {}
+    relation_groups: Dict[str, List[Tuple[str, str, str]]] = {}
+
+    topo_edges, _, topo_names, topo_static_attrs = _build_topology_edges(
+        coords,
+        producer_ids,
+        distances=distances,
+        top_k=config.graph_neighbor_k,
+    )
+    if "topo" in graph_types:
+        edge_index_dict_by_graph["topo"] = topo_edges
+        edge_feature_names["topo"] = topo_names
+        relation_groups["topo"] = list(topo_edges.keys())
+        edge_static_attrs["topo"] = topo_static_attrs
+        edge_attr_dict_by_graph_and_time["topo"] = {
+            pd.Timestamp(ds): {edge_type: topo_static_attrs[edge_type].copy() for edge_type in topo_edges}
+            for ds in dates
+        }
+
+    edge_static = pair_table.attrs.get("graph_edge_static", pd.DataFrame()) if hasattr(pair_table, "attrs") else pd.DataFrame()
+    edge_temporal = pair_table.attrs.get("graph_edge_temporal", pd.DataFrame()) if hasattr(pair_table, "attrs") else pd.DataFrame()
+    if isinstance(edge_static, pd.DataFrame) and not edge_static.empty and injector_ids and producer_ids:
+        inj_index = {well: idx for idx, well in enumerate(injector_ids)}
+        prod_index = {well: idx for idx, well in enumerate(producer_ids)}
+        edge_static = edge_static.copy()
+        edge_static["prod_id"] = edge_static["prod_id"].astype(str)
+        edge_static["inj_id"] = edge_static["inj_id"].astype(str)
+        valid_pairs = edge_static["prod_id"].isin(prod_index) & edge_static["inj_id"].isin(inj_index)
+        edge_static = edge_static[valid_pairs].sort_values(["inj_id", "prod_id"]).reset_index(drop=True)
+
+        base_src = edge_static["inj_id"].map(inj_index).to_numpy(dtype=np.int64)
+        base_dst = edge_static["prod_id"].map(prod_index).to_numpy(dtype=np.int64)
+        base_edge_index = np.vstack([base_src, base_dst]) if len(edge_static) else np.zeros((2, 0), dtype=np.int64)
+
+        temporal_lookup: Dict[pd.Timestamp, pd.DataFrame] = {}
+        if isinstance(edge_temporal, pd.DataFrame) and not edge_temporal.empty:
+            dyn = edge_temporal.copy()
+            dyn["ds"] = pd.to_datetime(dyn["ds"])
+            dyn["prod_id"] = dyn["prod_id"].astype(str)
+            dyn["inj_id"] = dyn["inj_id"].astype(str)
+            temporal_lookup = {pd.Timestamp(ds): frame.set_index(["inj_id", "prod_id"]) for ds, frame in dyn.groupby("ds")}
+
+        graph_specs = {
+            "bin": {
+                "features": ["edge_exists", "kernel_weight", "distance_m", "metric_distance_m"],
+                "builder": lambda row, dyn_row: [
+                    1.0,
+                    float(row.get("kernel_weight", row.get("weight", 0.0))),
+                    float(row.get("distance_m", 0.0)),
+                    float(row.get("metric_distance_m", row.get("distance_m", 0.0))),
+                ],
+            },
+            "cond": {
+                "features": ["kernel_weight", "crm_weight", "corr", "lag", "tau", "causal_score", "attn_alpha_train_mean"],
+                "builder": lambda row, dyn_row: [
+                    float(row.get("kernel_weight", row.get("weight", 0.0))),
+                    float(row.get("crm_weight", row.get("kernel_weight", row.get("weight", 0.0)))),
+                    float(row.get("corr", 0.0)),
+                    float(row.get("lag", 0.0)),
+                    float(row.get("tau", 0.0)),
+                    float(row.get("causal_score", 0.0)),
+                    float(row.get("attn_alpha_train_mean", row.get("crm_weight", 0.0))),
+                ],
+            },
+            "dyn": {
+                "features": ["alpha_t", "lagged_rate_t", "crm_rate_t", "lagged_wwit_diff_t", "contribution_t", "stage_id", "regime_id"],
+                "builder": lambda row, dyn_row: [
+                    float((dyn_row or {}).get("alpha_t", row.get("attn_alpha_train_mean", row.get("kernel_weight", 0.0)))),
+                    float((dyn_row or {}).get("lagged_rate_t", 0.0)),
+                    float((dyn_row or {}).get("crm_rate_t", 0.0)),
+                    float((dyn_row or {}).get("lagged_wwit_diff_t", 0.0)),
+                    float((dyn_row or {}).get("contribution_t", 0.0)),
+                    float((dyn_row or {}).get("stage_id", 0.0) or 0.0),
+                    float((dyn_row or {}).get("regime_id", 0.0) or 0.0),
+                ],
+            },
+            "causal": {
+                "features": ["causal_score", "attn_alpha_train_mean", "attn_alpha_train_last", "attn_alpha_full_last", "lag", "tau"],
+                "builder": lambda row, dyn_row: [
+                    float(row.get("causal_score", 0.0)),
+                    float(row.get("attn_alpha_train_mean", row.get("crm_weight", 0.0))),
+                    float(row.get("attn_alpha_train_last", row.get("crm_weight", 0.0))),
+                    float(row.get("attn_alpha_full_last", row.get("crm_weight", 0.0))),
+                    float(row.get("lag", 0.0)),
+                    float(row.get("tau", 0.0)),
+                ],
+            },
+        }
+
+        for graph_type in graph_types:
+            if graph_type == "topo" or graph_type not in graph_specs:
+                continue
+            edge_type = ("injector", graph_type, "producer")
+            edge_index_dict_by_graph[graph_type] = {edge_type: base_edge_index.copy()}
+            edge_feature_names[graph_type] = graph_specs[graph_type]["features"]
+            relation_groups[graph_type] = [edge_type]
+            edge_static_attrs[graph_type] = {}
+            time_map: Dict[pd.Timestamp, Dict[Tuple[str, str, str], np.ndarray]] = {}
+            static_arr = np.vstack([graph_specs[graph_type]["builder"](row, None) for _, row in edge_static.iterrows()]) if len(edge_static) else np.zeros((0, len(graph_specs[graph_type]["features"])), dtype=float)
+            edge_static_attrs[graph_type][edge_type] = static_arr
+            for ds in dates:
+                dyn_frame = temporal_lookup.get(pd.Timestamp(ds))
+                rows: List[List[float]] = []
+                for _, row in edge_static.iterrows():
+                    dyn_row = None
+                    if dyn_frame is not None and (row["inj_id"], row["prod_id"]) in dyn_frame.index:
+                        dyn_record = dyn_frame.loc[(row["inj_id"], row["prod_id"])]
+                        if isinstance(dyn_record, pd.DataFrame):
+                            dyn_record = dyn_record.iloc[0]
+                        dyn_row = dyn_record.to_dict()
+                    rows.append(graph_specs[graph_type]["builder"](row, dyn_row))
+                time_map[pd.Timestamp(ds)] = {edge_type: np.asarray(rows, dtype=float) if rows else np.zeros((0, len(graph_specs[graph_type]["features"])), dtype=float)}
+            edge_attr_dict_by_graph_and_time[graph_type] = time_map
+
+    if config.stgnn_use_reverse_edges:
+        for graph_type, edge_map in list(edge_index_dict_by_graph.items()):
+            reversed_edges: Dict[Tuple[str, str, str], np.ndarray] = {}
+            static_attrs_map = edge_static_attrs.setdefault(graph_type, {})
+            for edge_type, edge_index in list(edge_map.items()):
+                src_type, relation, dst_type = edge_type
+                reverse_type = (dst_type, f"rev_{relation}", src_type)
+                reversed_edges[reverse_type] = edge_index[[1, 0], :].copy() if edge_index.size else edge_index.copy()
+                relation_groups.setdefault(graph_type, []).append(reverse_type)
+                if edge_type in static_attrs_map:
+                    static_attrs_map[reverse_type] = static_attrs_map[edge_type].copy()
+            edge_map.update(reversed_edges)
+            if graph_type in edge_attr_dict_by_graph_and_time:
+                for ds, attrs_by_type in edge_attr_dict_by_graph_and_time[graph_type].items():
+                    for edge_type, edge_attr in list(attrs_by_type.items()):
+                        src_type, relation, dst_type = edge_type
+                        reverse_type = (dst_type, f"rev_{relation}", src_type)
+                        attrs_by_type[reverse_type] = edge_attr.copy()
+
+    graph_metadata = {
+        "producer_ids": producer_ids,
+        "injector_ids": injector_ids,
+        "producer_feature_names": producer_feature_cols,
+        "injector_feature_names": injector_feature_cols,
+        "producer_static_feature_names": list(producer_static.columns),
+        "injector_static_feature_names": list(injector_static.columns),
+        "edge_feature_names": edge_feature_names,
+        "relation_groups": relation_groups,
+    }
+
+    return {
+        "graph_types": graph_types,
+        "dates": [pd.Timestamp(ds) for ds in dates],
+        "node_static_features": {
+            "producer": producer_static.to_numpy(dtype=float) if not producer_static.empty else np.zeros((len(producer_ids), 0), dtype=float),
+            "injector": injector_static.to_numpy(dtype=float) if not injector_static.empty else np.zeros((len(injector_ids), 0), dtype=float),
+        },
+        "node_dynamic_features_by_time": {
+            pd.Timestamp(ds): {
+                "producer": producer_dynamic[pd.Timestamp(ds)],
+                "injector": injector_dynamic[pd.Timestamp(ds)],
+            }
+            for ds in dates
+        },
+        "producer_targets_by_time": {
+            pd.Timestamp(ds): producer_dynamic[pd.Timestamp(ds)][:, [producer_feature_cols.index("wlpr")]] if "wlpr" in producer_feature_cols else np.zeros((len(producer_ids), 1), dtype=float)
+            for ds in dates
+        },
+        "edge_index_dict_by_graph": edge_index_dict_by_graph,
+        "edge_attr_dict_by_graph_and_time": edge_attr_dict_by_graph_and_time,
+        "edge_static_attrs": edge_static_attrs,
+        "cluster_map": cluster_map,
+        "graph_metadata": graph_metadata,
+        "pair_table": edge_static if isinstance(edge_static, pd.DataFrame) else pd.DataFrame(),
+    }
+
+
+def apply_scenario_to_graphs(multigraph_spec: Dict[str, Any], scenario: Dict[str, Any]) -> Dict[str, Any]:
+    if not multigraph_spec:
+        return multigraph_spec
+    scenario_type = str((scenario or {}).get("type", "")).strip().lower()
+    if scenario_type != "injector_shutoff":
+        return deepcopy(multigraph_spec)
+
+    edited = deepcopy(multigraph_spec)
+    injector_id = str(scenario.get("well", "")).strip()
+    cutoff = pd.Timestamp(scenario.get("date"))
+    inj_ids = edited.get("graph_metadata", {}).get("injector_ids", [])
+    if injector_id not in inj_ids:
+        return edited
+    inj_idx = inj_ids.index(injector_id)
+
+    scenario_deltas: List[Dict[str, Any]] = []
+    for ds, node_payload in edited.get("node_dynamic_features_by_time", {}).items():
+        if pd.Timestamp(ds) < cutoff:
+            continue
+        injector_features = node_payload.get("injector")
+        if injector_features is not None and injector_features.shape[0] > inj_idx:
+            original = injector_features[inj_idx].copy()
+            injector_features[inj_idx, :] = 0.0
+            scenario_deltas.append(
+                {
+                    "ds": pd.Timestamp(ds),
+                    "graph_type": "controls",
+                    "inj_id": injector_id,
+                    "prod_id": None,
+                    "delta_l1": float(np.abs(original).sum()),
+                }
+            )
+        for graph_type, attrs_by_time in edited.get("edge_attr_dict_by_graph_and_time", {}).items():
+            if graph_type not in {"bin", "cond", "dyn", "causal"}:
+                continue
+            edge_map = edited.get("edge_index_dict_by_graph", {}).get(graph_type, {})
+            for edge_type, edge_index in edge_map.items():
+                if not edge_type[0] == "injector":
+                    continue
+                if pd.Timestamp(ds) not in attrs_by_time or edge_type not in attrs_by_time[pd.Timestamp(ds)]:
+                    continue
+                mask = edge_index[0] == inj_idx
+                if not np.any(mask):
+                    continue
+                edge_attr = attrs_by_time[pd.Timestamp(ds)][edge_type]
+                before = edge_attr[mask].copy()
+                if graph_type == "bin":
+                    edge_attr[mask] = 0.0
+                elif graph_type == "cond":
+                    edge_attr[mask] = edge_attr[mask] * 0.1
+                else:
+                    edge_attr[mask] = 0.0
+                prod_ids = edited.get("graph_metadata", {}).get("producer_ids", [])
+                prod_indices = edge_index[1][mask]
+                for row_idx, prod_pos in enumerate(prod_indices):
+                    scenario_deltas.append(
+                        {
+                            "ds": pd.Timestamp(ds),
+                            "graph_type": graph_type,
+                            "inj_id": injector_id,
+                            "prod_id": prod_ids[int(prod_pos)] if int(prod_pos) < len(prod_ids) else None,
+                            "delta_l1": float(np.abs(before[row_idx] - edge_attr[mask][row_idx]).sum()),
+                        }
+                    )
+    edited["scenario_edge_deltas"] = pd.DataFrame.from_records(scenario_deltas)
+    edited["scenario"] = dict(scenario)
+    return edited

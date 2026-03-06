@@ -282,6 +282,82 @@ def calculate_metrics_by_horizon(
     return horizon_metrics
 
 
+def calculate_operational_metrics(
+    merged: pd.DataFrame,
+    *,
+    cluster_col: str = "prod_cluster",
+) -> Dict[str, Optional[float]]:
+    if merged is None or merged.empty or not {"unique_id", "y", "y_hat"}.issubset(merged.columns):
+        return {
+            "macro_mae_by_well": None,
+            "worst_3_wells_mae": None,
+            "worst_3_wells_r2": None,
+        }
+
+    per_well_rows = []
+    for unique_id, group in merged.groupby("unique_id"):
+        y_true = group["y"].to_numpy(dtype=float)
+        y_pred = group["y_hat"].to_numpy(dtype=float)
+        per_well_rows.append(
+            {
+                "unique_id": str(unique_id),
+                "mae": float(np.mean(np.abs(y_true - y_pred))),
+                "r2": r_squared(y_true, y_pred) if len(group) > 1 else np.nan,
+            }
+        )
+    per_well = pd.DataFrame.from_records(per_well_rows)
+    if per_well.empty:
+        return {"macro_mae_by_well": None, "worst_3_wells_mae": None, "worst_3_wells_r2": None}
+
+    worst = per_well.sort_values("mae", ascending=False).head(3)
+    metrics: Dict[str, Optional[float]] = {
+        "macro_mae_by_well": float(per_well["mae"].mean()),
+        "worst_3_wells_mae": float(worst["mae"].mean()),
+        "worst_3_wells_r2": float(worst["r2"].mean()) if worst["r2"].notna().any() else None,
+    }
+
+    if {"y_hat_baseline", "y_hat_shutoff"}.issubset(merged.columns):
+        baseline_delta = merged["y_hat_shutoff"].to_numpy(dtype=float) - merged["y_hat_baseline"].to_numpy(dtype=float)
+        actual_delta = merged["y"].to_numpy(dtype=float) - merged["y_hat_baseline"].to_numpy(dtype=float)
+        direction = np.sign(baseline_delta) == np.sign(actual_delta)
+        metrics["scenario_direction_accuracy"] = float(np.mean(direction.astype(float)))
+    else:
+        metrics["scenario_direction_accuracy"] = None
+
+    if "event_window_flag" in merged.columns:
+        mask = pd.to_numeric(merged["event_window_flag"], errors="coerce").fillna(0).astype(bool)
+        metrics["event_window_error"] = float(np.mean(np.abs(merged.loc[mask, "y"] - merged.loc[mask, "y_hat"]))) if mask.any() else None
+    else:
+        metrics["event_window_error"] = None
+
+    if cluster_col in merged.columns:
+        rank_true = merged.groupby(cluster_col)["y"].sum()
+        rank_pred = merged.groupby(cluster_col)["y_hat"].sum()
+        aligned = rank_true.to_frame("true").join(rank_pred.to_frame("pred"), how="inner")
+        if len(aligned) >= 2:
+            metrics["response_rank_accuracy"] = float(stats.spearmanr(aligned["true"], aligned["pred"]).correlation)
+        else:
+            metrics["response_rank_accuracy"] = None
+    else:
+        metrics["response_rank_accuracy"] = None
+
+    if "crm_max_connectivity" in merged.columns:
+        response = merged.groupby("unique_id")["y_hat"].mean()
+        connectivity = merged.groupby("unique_id")["crm_max_connectivity"].mean()
+        aligned = response.to_frame("response").join(connectivity.to_frame("connectivity"), how="inner")
+        if len(aligned) >= 2:
+            metrics["connectivity_consistency_score"] = float(stats.spearmanr(aligned["response"], aligned["connectivity"]).correlation)
+        else:
+            metrics["connectivity_consistency_score"] = None
+    else:
+        metrics["connectivity_consistency_score"] = None
+
+    return {
+        key: float(value) if isinstance(value, (int, float, np.floating)) and np.isfinite(value) else None
+        for key, value in metrics.items()
+    }
+
+
 def print_metrics_summary(
     metrics: Dict[str, float],
     title: str = "Metrics Summary",

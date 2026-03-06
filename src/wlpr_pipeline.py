@@ -11,10 +11,11 @@ try:
     from .config import PipelineConfig
     from .conformal import compute_conformal_profile
     from .features_injection import build_injection_lag_features
-    from .features_graph import build_graph_features
+    from .features_graph import build_graph_features, build_multigraph_spec
     from .data_validation import WellDataValidator
-    from .metrics_extended import calculate_all_metrics
-    from .metrics_reservoir import compute_all_reservoir_metrics
+    from .graph_dataset import apply_scenario_to_graph_bundle, to_heterodata_snapshots, to_dynamic_hetero_temporal_signal
+    from .metrics_extended import calculate_all_metrics, calculate_operational_metrics
+    from .metrics_reservoir import compute_all_reservoir_metrics, compute_intervention_response_metrics
     from .logging_config import log_execution_time
     from .caching import CacheManager
     from .data_preprocessing_advanced import PhysicsAwarePreprocessor
@@ -23,14 +24,16 @@ try:
         create_spatial_features,
         create_time_series_embeddings,
     )
+    from .train_stgnn import fit_and_forecast_stgnn
 except ImportError:  # pragma: no cover
     from config import PipelineConfig
     from conformal import compute_conformal_profile
     from features_injection import build_injection_lag_features
-    from features_graph import build_graph_features
+    from features_graph import build_graph_features, build_multigraph_spec
     from data_validation import WellDataValidator
-    from metrics_extended import calculate_all_metrics
-    from metrics_reservoir import compute_all_reservoir_metrics
+    from graph_dataset import apply_scenario_to_graph_bundle, to_heterodata_snapshots, to_dynamic_hetero_temporal_signal
+    from metrics_extended import calculate_all_metrics, calculate_operational_metrics
+    from metrics_reservoir import compute_all_reservoir_metrics, compute_intervention_response_metrics
     from logging_config import log_execution_time
     from caching import CacheManager
     from data_preprocessing_advanced import PhysicsAwarePreprocessor
@@ -39,6 +42,7 @@ except ImportError:  # pragma: no cover
         create_spatial_features,
         create_time_series_embeddings,
     )
+    from train_stgnn import fit_and_forecast_stgnn
 
 EPSILON = 1e-6
 logger = logging.getLogger(__name__)
@@ -326,6 +330,71 @@ def _fill_missing_features(df: pd.DataFrame, feature_cols: set, context: str = "
     return df
 
 
+def _add_pseudo_productivity_features(
+    prod_df: pd.DataFrame,
+    train_cutoff: pd.Timestamp,
+) -> pd.DataFrame:
+    df = prod_df.copy()
+    if "wthp" not in df.columns or "wlpr" not in df.columns:
+        return df
+    well_col = "well" if "well" in df.columns else "unique_id"
+    train_mask = df["ds"] <= train_cutoff
+    p_ref = df.loc[train_mask & (df["wthp"] > 0)].groupby(well_col)["wthp"].quantile(0.95)
+    df["_p_ref"] = df[well_col].map(p_ref)
+    dp = (df["_p_ref"] - df["wthp"]).clip(lower=1.0)
+    df["pseudo_productivity_index"] = df["wlpr"] / dp
+    df["productivity_index"] = df["pseudo_productivity_index"]
+    df["dp_drawdown"] = dp
+    df = df.drop(columns=["_p_ref"])
+    df["pseudo_productivity_index"] = df["pseudo_productivity_index"].fillna(0.0)
+    df["productivity_index"] = df["productivity_index"].fillna(0.0)
+    df["dp_drawdown"] = df["dp_drawdown"].fillna(0.0)
+    logger.info("Computed pseudo productivity index J(t) and drawdown dp for %d wells", df[well_col].nunique())
+    return df
+
+
+def _attach_graph_frames(
+    frames: Dict[str, Any],
+    prod_df: pd.DataFrame,
+    inj_df: pd.DataFrame,
+    pair_summary: pd.DataFrame,
+    coords: pd.DataFrame,
+    config: PipelineConfig,
+    *,
+    distances: Optional[pd.DataFrame],
+) -> Dict[str, Any]:
+    multigraph_spec = build_multigraph_spec(
+        prod_df,
+        inj_df,
+        pair_summary,
+        coords,
+        distances,
+        config,
+    )
+    graph_dataset = to_heterodata_snapshots(multigraph_spec, config)
+    temporal_signal = None
+    try:
+        temporal_signal = to_dynamic_hetero_temporal_signal(multigraph_spec, config)
+    except Exception as exc:
+        logger.warning("PyG Temporal signal adapter unavailable: %s", exc)
+    frames["multigraph_spec"] = multigraph_spec
+    frames["graph_dataset"] = graph_dataset
+    frames["graph_temporal_signal"] = temporal_signal
+    return frames
+
+
+def _merge_prediction_context(pred_df: pd.DataFrame, reference_df: pd.DataFrame) -> pd.DataFrame:
+    if pred_df is None or pred_df.empty or reference_df is None or reference_df.empty:
+        return pred_df
+    join_cols = ["unique_id", "ds"]
+    context_candidates = ["prod_cluster", "regime_id", "regime", "well_cluster", "crm_max_connectivity"]
+    context_cols = [col for col in context_candidates if col in reference_df.columns]
+    if not context_cols:
+        return pred_df
+    context_df = reference_df[join_cols + context_cols].drop_duplicates(subset=join_cols, keep="first")
+    return pred_df.merge(context_df, on=join_cols, how="left")
+
+
 # ---------------------------------------------------------------------------
 # Walk-forward cross-validation
 # ---------------------------------------------------------------------------
@@ -427,18 +496,7 @@ def run_walk_forward_validation(
             fold_prod = create_time_series_embeddings(
                 fold_prod, feature_cols=key_features, window=12, n_components=3, train_cutoff=cutoff_date, date_col="ds",
             )
-            # Productivity Index J(t) for fold
-            if "wthp" in fold_prod.columns and "wlpr" in fold_prod.columns:
-                fw = "well" if "well" in fold_prod.columns else "unique_id"
-                ftrain_mask = fold_prod["ds"] <= cutoff_date
-                fp_ref = fold_prod.loc[ftrain_mask & (fold_prod["wthp"] > 0)].groupby(fw)["wthp"].quantile(0.95)
-                fold_prod["_p_ref"] = fold_prod[fw].map(fp_ref)
-                fdp = (fold_prod["_p_ref"] - fold_prod["wthp"]).clip(lower=1.0)
-                fold_prod["productivity_index"] = fold_prod["wlpr"] / fdp
-                fold_prod["dp_drawdown"] = fdp
-                fold_prod = fold_prod.drop(columns=["_p_ref"])
-                fold_prod["productivity_index"] = fold_prod["productivity_index"].fillna(0.0)
-                fold_prod["dp_drawdown"] = fold_prod["dp_drawdown"].fillna(0.0)
+            fold_prod = _add_pseudo_productivity_features(fold_prod, cutoff_date)
 
             fold_target_wells = sorted(fold_prod["well"].unique()) if "well" in fold_prod.columns else sorted(fold_prod["unique_id"].unique())
             fold_prod, _ = build_graph_features(
@@ -474,7 +532,27 @@ def run_walk_forward_validation(
             fold_val = fold_val_raw
             fold_static_df = static_df
 
-        if config.model_type == "xlinear":
+        if config.model_type == "stgnn_pyg":
+            fold_frames = {
+                "train_df": fold_train,
+                "test_df": fold_val,
+                "target_wells": sorted(fold_train["unique_id"].unique()),
+                "test_start": fold_val["ds"].min(),
+                "train_cutoff": cutoff_date,
+                "injection_summary": fold_pair_summary if isinstance(fold_pair_summary, pd.DataFrame) else pd.DataFrame(),
+            }
+            fold_frames = _attach_graph_frames(
+                fold_frames,
+                fold_prod,
+                inj_df,
+                fold_pair_summary if isinstance(fold_pair_summary, pd.DataFrame) else pd.DataFrame(),
+                coords,
+                config,
+                distances=distances,
+            )
+            stgnn_artifacts = fit_and_forecast_stgnn(fold_frames, config)
+            preds = stgnn_artifacts.predictions
+        elif config.model_type == "xlinear":
             preds = _xlinear_predict(fold_train, fold_val, config)
         else:
             cov_cols = list(set(config.hist_exog + config.futr_exog))
@@ -487,6 +565,7 @@ def run_walk_forward_validation(
                 ignore_index=True,
             ).drop_duplicates(subset=["unique_id", "ds"], keep="first").sort_values(["unique_id", "ds"])
             preds = _chronos2_predict(fold_train, future_df, config)
+        preds = _merge_prediction_context(preds, fold_val)
 
         metrics, merged = evaluate_predictions(preds, fold_val, fold_train)
         overall_raw = metrics.get("overall", {})
@@ -536,8 +615,12 @@ def run_walk_forward_validation(
         if not fold_residuals.empty:
             fold_residuals["abs_err"] = (fold_residuals["y"] - fold_residuals["y_hat"]).abs()
             fold_residuals["fold"] = int(split["fold"])
+            extra_cols = [col for col in ["prod_cluster", "regime_id", "regime", "well_cluster"] if col in merged.columns]
             residual_pool_frames.append(
-                fold_residuals[["fold", "unique_id", "ds", "h_step", "abs_err"]].sort_values(["ds", "unique_id"])
+                fold_residuals.join(
+                    merged[extra_cols],
+                    how="left",
+                )[["fold", "unique_id", "ds", "h_step", "abs_err"] + extra_cols].sort_values(["ds", "unique_id"])
             )
 
     aggregate = {
@@ -560,6 +643,7 @@ def run_walk_forward_validation(
                 per_horizon=config.conformal_per_horizon,
                 exp_decay=config.conformal_exp_decay,
                 min_samples=config.conformal_min_samples,
+                group_levels=dict(config.resolved_conformal_group_levels()),
             )
             if conformal_profile:
                 logger.info(
@@ -674,19 +758,7 @@ def prepare_model_frames(
         prod_df, feature_cols=key_features, window=12, n_components=3, train_cutoff=train_cutoff, date_col="ds",
     )
 
-    # Productivity Index J(t) = wlpr / (P_ref - wthp) [PI-GNN inspired]
-    if "wthp" in prod_df.columns and "wlpr" in prod_df.columns:
-        well_col = "well" if "well" in prod_df.columns else "unique_id"
-        train_mask = prod_df["ds"] <= train_cutoff
-        p_ref = prod_df.loc[train_mask & (prod_df["wthp"] > 0)].groupby(well_col)["wthp"].quantile(0.95)
-        prod_df["_p_ref"] = prod_df[well_col].map(p_ref)
-        dp = (prod_df["_p_ref"] - prod_df["wthp"]).clip(lower=1.0)
-        prod_df["productivity_index"] = prod_df["wlpr"] / dp
-        prod_df["dp_drawdown"] = dp
-        prod_df = prod_df.drop(columns=["_p_ref"])
-        prod_df["productivity_index"] = prod_df["productivity_index"].fillna(0.0)
-        prod_df["dp_drawdown"] = prod_df["dp_drawdown"].fillna(0.0)
-        logger.info("Computed productivity index J(t) and drawdown dp for %d wells", prod_df[well_col].nunique())
+    prod_df = _add_pseudo_productivity_features(prod_df, train_cutoff)
 
     well_types = raw_df.sort_values("date").groupby("well").tail(1).set_index("well")["type"].to_dict()
     prod_df, _graph_static = build_graph_features(
@@ -724,7 +796,7 @@ def prepare_model_frames(
             static_df[col] = 0.0
 
     logger.info("Prepared frames: train=%d rows, test=%d rows, future=%d rows", len(train_df), len(test_df), len(futr_df))
-    return {
+    frames: Dict[str, Any] = {
         "train_df": train_df,
         "test_df": test_df,
         "futr_df": futr_df,
@@ -737,6 +809,17 @@ def prepare_model_frames(
         "prod_base_df": prod_base,
         "inj_df": inj_df,
     }
+    if config.model_type == "stgnn_pyg":
+        frames = _attach_graph_frames(
+            frames,
+            prod_df,
+            inj_df,
+            pair_summary,
+            coords,
+            config,
+            distances=distances,
+        )
+    return frames
 
 
 # ---------------------------------------------------------------------------
@@ -1005,8 +1088,30 @@ def train_and_forecast(frames: Dict[str, pd.DataFrame], config: PipelineConfig) 
     train_df = frames["train_df"]
     test_df = frames["test_df"]
 
+    if config.model_type == "stgnn_pyg":
+        scenario = frames.get("scenario")
+        graph_dataset = frames.get("graph_dataset")
+        if scenario and graph_dataset:
+            frames = dict(frames)
+            frames["graph_dataset"] = apply_scenario_to_graph_bundle(graph_dataset, scenario, config)
+            if "multigraph_spec" in frames["graph_dataset"]:
+                frames["multigraph_spec"] = frames["graph_dataset"]["multigraph_spec"]
+        artifacts = fit_and_forecast_stgnn(frames, config)
+        preds = _merge_prediction_context(artifacts.predictions, test_df)
+        preds.attrs["graph_fusion_weights"] = artifacts.graph_fusion_weights
+        preds.attrs["edge_allocations"] = artifacts.edge_allocations
+        preds.attrs["physics_history"] = artifacts.physics_history
+        preds.attrs["well_event_metrics"] = artifacts.well_event_metrics
+        preds.attrs["training_summary"] = artifacts.training_summary
+        scenario_edge_deltas = frames.get("graph_dataset", {}).get("scenario_edge_deltas")
+        if isinstance(scenario_edge_deltas, pd.DataFrame) and not scenario_edge_deltas.empty:
+            preds.attrs["scenario_edge_deltas"] = scenario_edge_deltas
+        logger.info("Generated %d stgnn_pyg forecast rows", len(preds))
+        return preds
+
     if config.model_type == "xlinear":
         preds = _xlinear_predict(train_df, test_df, config)
+        preds = _merge_prediction_context(preds, test_df)
         logger.info("Generated %d XLinear forecast rows", len(preds))
         return preds
 
@@ -1020,6 +1125,7 @@ def train_and_forecast(frames: Dict[str, pd.DataFrame], config: PipelineConfig) 
         ignore_index=True,
     ).drop_duplicates(subset=["unique_id", "ds"], keep="first").sort_values(["unique_id", "ds"])
     preds = _chronos2_predict(train_df, future_df, config)
+    preds = _merge_prediction_context(preds, test_df)
     logger.info("Generated %d Chronos-2 forecast rows", len(preds))
     return preds
 
@@ -1073,10 +1179,11 @@ def merge_forecast_frame(pred_df: pd.DataFrame, test_df: pd.DataFrame) -> pd.Dat
         c for c in pred_df.columns if c.startswith("q_") or c.startswith("cp_")
     ]
     pred_cols = list(dict.fromkeys(pred_cols))
-    test_cols = ["unique_id", "ds", "y"]
-    if "time_idx" in test_df.columns:
-        test_cols.append("time_idx")
-    merged = test_df[test_cols].merge(
+    preserved_test_cols = [
+        col for col in test_df.columns
+        if col not in {"y_hat"} and col not in pred_cols
+    ]
+    merged = test_df[preserved_test_cols].merge(
         pred_df[pred_cols], on=["unique_id", "ds"], how="inner",
     )
     if merged.empty:
@@ -1108,6 +1215,7 @@ def evaluate_predictions(
         )
 
     reservoir_metrics = {}
+    operational_metrics = {}
     try:
         time_idx = (
             pd.to_numeric(merged["time_idx"], errors="coerce").to_numpy()
@@ -1136,10 +1244,17 @@ def evaluate_predictions(
     except Exception as exc:
         logger.warning("Could not compute reservoir metrics: %s", exc)
 
+    try:
+        operational_metrics.update(calculate_operational_metrics(merged))
+        operational_metrics.update(compute_intervention_response_metrics(merged))
+    except Exception as exc:
+        logger.warning("Could not compute operational metrics: %s", exc)
+
     metrics = {
         "overall": overall,
         "by_well": per_well,
         "observations": int(len(merged)),
         "reservoir": reservoir_metrics,
+        "operational": operational_metrics,
     }
     return metrics, merged

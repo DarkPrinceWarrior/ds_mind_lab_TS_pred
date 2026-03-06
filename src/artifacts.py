@@ -114,6 +114,40 @@ def save_artifacts(
             "aggregate": cv_results.get("aggregate"),
             "details_path": str(cv_path),
         }
+        conformal_profile = cv_results.get("conformal_profile")
+        if isinstance(conformal_profile, dict) and conformal_profile.get("grouped_profiles"):
+            conformal_path = output_dir / "grouped_conformal_profile.json"
+            with open(conformal_path, "w", encoding="utf-8") as handle:
+                json.dump(conformal_profile, handle, indent=2)
+            metadata["grouped_conformal_profile_path"] = str(conformal_path)
+
+    attr_artifacts = {
+        "graph_fusion_weights": ("graph_fusion_weights.parquet", pred_df.attrs.get("graph_fusion_weights")),
+        "edge_allocations": ("edge_allocations.parquet", pred_df.attrs.get("edge_allocations")),
+        "scenario_edge_deltas": ("scenario_edge_deltas.parquet", pred_df.attrs.get("scenario_edge_deltas")),
+        "well_event_metrics": ("well_event_metrics.csv", pred_df.attrs.get("well_event_metrics")),
+        "physics_history": ("physics_history.csv", pred_df.attrs.get("physics_history")),
+    }
+    for key, (filename, payload) in attr_artifacts.items():
+        if not isinstance(payload, pd.DataFrame) or payload.empty:
+            continue
+        path = output_dir / filename
+        if path.suffix == ".parquet":
+            try:
+                payload.to_parquet(path, index=False)
+            except Exception:
+                path = path.with_suffix(".csv")
+                payload.to_csv(path, index=False)
+        else:
+            payload.to_csv(path, index=False)
+        metadata[f"{key}_path"] = str(path)
+
+    training_summary = pred_df.attrs.get("training_summary")
+    if isinstance(training_summary, dict) and training_summary:
+        training_path = output_dir / "stgnn_training_summary.json"
+        with open(training_path, "w", encoding="utf-8") as handle:
+            json.dump(training_summary, handle, indent=2, default=str)
+        metadata["stgnn_training_summary_path"] = str(training_path)
     metadata_path = output_dir / "metadata.json"
     with open(metadata_path, "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
@@ -121,7 +155,7 @@ def save_artifacts(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="WLPR forecasting pipeline using Chronos-2 or XLinear")
+    parser = argparse.ArgumentParser(description="WLPR forecasting pipeline using Chronos-2, XLinear, or STGNN PyG")
     parser.add_argument(
         "--data-path",
         type=Path,
@@ -208,7 +242,7 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default="chronos2",
-        choices=["chronos2", "xlinear"],
+        choices=["chronos2", "xlinear", "stgnn_pyg"],
         help="Forecasting model to use (default: chronos2)",
     )
     parser.add_argument(
@@ -386,7 +420,7 @@ def main() -> None:
         if tracker:
             tracker.start_run()
             tracker.log_config(config)
-            model_label = "Chronos-2" if args.model == "chronos2" else "XLinear"
+            model_label = {"chronos2": "Chronos-2", "xlinear": "XLinear", "stgnn_pyg": "STGNN PyG"}.get(args.model, args.model)
             tracker.set_tags({
                 "pipeline": "wlpr_forecasting",
                 "model": model_label,
@@ -489,6 +523,21 @@ def main() -> None:
         tracker.log_artifact(output_dir / "wlpr_predictions.csv", "predictions")
         if (output_dir / "injection_lag_summary.csv").exists():
             tracker.log_artifact(output_dir / "injection_lag_summary.csv", "features")
+        for optional_name in [
+            "graph_fusion_weights.parquet",
+            "graph_fusion_weights.csv",
+            "edge_allocations.parquet",
+            "edge_allocations.csv",
+            "scenario_edge_deltas.parquet",
+            "scenario_edge_deltas.csv",
+            "grouped_conformal_profile.json",
+            "well_event_metrics.csv",
+            "physics_history.csv",
+            "stgnn_training_summary.json",
+        ]:
+            optional_path = output_dir / optional_name
+            if optional_path.exists():
+                tracker.log_artifact(optional_path, "graph_artifacts")
 
     elapsed = time.perf_counter() - start_time
     logger.info("=" * 80)
