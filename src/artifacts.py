@@ -251,6 +251,17 @@ def parse_args() -> argparse.Namespace:
         help="Disable conformal prediction intervals",
     )
     parser.add_argument(
+        "--disable-cv",
+        action="store_true",
+        help="Disable walk-forward cross-validation",
+    )
+    parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=None,
+        help="Override number of walk-forward CV folds",
+    )
+    parser.add_argument(
         "--conformal-alpha",
         type=float,
         default=None,
@@ -327,6 +338,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable stage-adaptive gating in causal_stage_geo attention",
     )
+    parser.add_argument(
+        "--stgnn-max-epochs",
+        type=int,
+        default=None,
+        help="Override max epochs for STGNN PyG training",
+    )
+    parser.add_argument(
+        "--stgnn-early-stop-patience",
+        type=int,
+        default=None,
+        help="Override early stopping patience for STGNN PyG training",
+    )
     return parser.parse_args()
 
 
@@ -372,6 +395,10 @@ def main() -> None:
         config.chronos_output_chunk_length = int(args.chronos_output_len)
     if args.disable_conformal:
         config.conformal_enabled = False
+    if args.disable_cv:
+        config.cv_enabled = False
+    if args.cv_folds is not None:
+        config.cv_folds = int(args.cv_folds)
     if args.conformal_alpha is not None:
         config.conformal_alpha = float(args.conformal_alpha)
     if args.conformal_method:
@@ -398,6 +425,10 @@ def main() -> None:
         config.inj_attention_geo_condition_strength = float(args.inj_attention_geo_condition_strength)
     if args.disable_inj_attention_stage_adaptive:
         config.inj_attention_stage_adaptive = False
+    if args.stgnn_max_epochs is not None:
+        config.stgnn_max_epochs = int(args.stgnn_max_epochs)
+    if args.stgnn_early_stop_patience is not None:
+        config.stgnn_early_stop_patience = int(args.stgnn_early_stop_patience)
 
     if not args.disable_cache:
         try:

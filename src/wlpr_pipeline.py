@@ -527,6 +527,10 @@ def run_walk_forward_validation(
             fold_static_df = static_df
 
         if config.model_type == "stgnn_pyg":
+            logger.info(
+                "Fold %d: building graph snapshots and training STGNN PyG",
+                split["fold"],
+            )
             fold_frames = {
                 "train_df": fold_train,
                 "test_df": fold_val,

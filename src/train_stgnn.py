@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -16,6 +17,8 @@ except ImportError:  # pragma: no cover
     from graph_dataset import build_temporal_graph_windows
     from models_stgnn import STGNNPyG
     from physics_regularizers import build_physics_loss_breakdown
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -275,8 +278,19 @@ def fit_and_forecast_stgnn(
     best_val = float("inf")
     best_state: Optional[Dict[str, torch.Tensor]] = None
     patience = 0
+    max_epochs = max(int(config.stgnn_max_epochs), 1)
 
-    for epoch in range(1, max(int(config.stgnn_max_epochs), 1) + 1):
+    logger.info(
+        "STGNN training start: train_windows=%d, val_windows=%d, horizon=%d, input_size=%d, max_epochs=%d, device=%s",
+        len(train_samples),
+        len(val_samples),
+        int(config.horizon),
+        int(config.input_size),
+        max_epochs,
+        device,
+    )
+
+    for epoch in range(1, max_epochs + 1):
         model.train()
         train_losses = []
         for sample in train_samples:
@@ -290,6 +304,16 @@ def fit_and_forecast_stgnn(
             physics_logs.append(log_parts)
         val_loss = _evaluate_samples(model, val_samples or train_samples[-1:], loss_fn, multigraph_spec, config, device, epoch)
         scheduler.step(val_loss)
+        mean_train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
+        if epoch == 1 or epoch == max_epochs or epoch % 5 == 0:
+            logger.info(
+                "STGNN epoch %d/%d: train_loss=%.5f, val_loss=%.5f, best_val=%.5f",
+                epoch,
+                max_epochs,
+                mean_train_loss,
+                float(val_loss),
+                float(min(best_val, val_loss)),
+            )
         if val_loss < best_val:
             best_val = val_loss
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
@@ -297,6 +321,12 @@ def fit_and_forecast_stgnn(
         else:
             patience += 1
             if patience >= max(int(config.stgnn_early_stop_patience), 1):
+                logger.info(
+                    "STGNN early stopping at epoch %d: best_val=%.5f, patience=%d",
+                    epoch,
+                    float(best_val),
+                    patience,
+                )
                 break
 
     if best_state is not None:
@@ -317,6 +347,12 @@ def fit_and_forecast_stgnn(
         "epochs_trained": int(physics_df["epoch"].max()) if not physics_df.empty else 0,
         "device": str(device),
     }
+    logger.info(
+        "STGNN training complete: epochs=%d, best_val=%.5f, forecast_rows=%d",
+        training_summary["epochs_trained"],
+        float(best_val),
+        len(pred_df),
+    )
     return STGNNTrainingArtifacts(
         predictions=pred_df,
         graph_fusion_weights=fusion_df,
