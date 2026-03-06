@@ -85,62 +85,6 @@ def to_heterodata_snapshots(
     }
 
 
-def to_dynamic_hetero_temporal_signal(
-    multigraph_spec: Dict[str, Any],
-    config: Any,
-) -> Dict[str, Any]:
-    try:
-        from torch_geometric_temporal.signal import DynamicHeteroGraphTemporalSignal
-    except ImportError:
-        return {
-            "backend": "fallback_snapshots",
-            "payload": to_heterodata_snapshots(multigraph_spec, config),
-        }
-
-    dates = [pd.Timestamp(ds) for ds in multigraph_spec.get("dates", [])]
-    edge_indices: List[Dict[Any, np.ndarray]] = []
-    edge_weights: List[Dict[Any, np.ndarray]] = []
-    features: List[Dict[str, np.ndarray]] = []
-    targets: List[Dict[str, np.ndarray]] = []
-
-    for ds in dates:
-        edge_idx_snapshot: Dict[Any, np.ndarray] = {}
-        edge_attr_snapshot: Dict[Any, np.ndarray] = {}
-        for graph_type, edge_dict in multigraph_spec.get("edge_index_dict_by_graph", {}).items():
-            attrs_by_type = multigraph_spec.get("edge_attr_dict_by_graph_and_time", {}).get(graph_type, {}).get(pd.Timestamp(ds), {})
-            for edge_type, edge_index in edge_dict.items():
-                edge_idx_snapshot[edge_type] = np.asarray(edge_index, dtype=np.int64)
-                edge_attr_snapshot[edge_type] = np.asarray(
-                    attrs_by_type.get(edge_type, multigraph_spec.get("edge_static_attrs", {}).get(graph_type, {}).get(edge_type, np.zeros((edge_index.shape[1], 0), dtype=float))),
-                    dtype=float,
-                )
-        node_payload = multigraph_spec["node_dynamic_features_by_time"][pd.Timestamp(ds)]
-        features.append(
-            {
-                "producer": np.concatenate(
-                    [
-                        np.asarray(multigraph_spec.get("node_static_features", {}).get("producer", np.zeros((0, 0))), dtype=float),
-                        np.asarray(node_payload.get("producer", np.zeros((0, 0))), dtype=float),
-                    ],
-                    axis=1,
-                ),
-                "injector": np.concatenate(
-                    [
-                        np.asarray(multigraph_spec.get("node_static_features", {}).get("injector", np.zeros((0, 0))), dtype=float),
-                        np.asarray(node_payload.get("injector", np.zeros((0, 0))), dtype=float),
-                    ],
-                    axis=1,
-                ),
-            }
-        )
-        targets.append({"producer": np.asarray(multigraph_spec.get("producer_targets_by_time", {}).get(pd.Timestamp(ds), np.zeros((0, 1))), dtype=float)})
-        edge_indices.append(edge_idx_snapshot)
-        edge_weights.append(edge_attr_snapshot)
-
-    signal = DynamicHeteroGraphTemporalSignal(edge_indices=edge_indices, edge_weights=edge_weights, features=features, targets=targets)
-    return {"backend": "pyg_temporal", "payload": signal, "dates": dates}
-
-
 def build_temporal_graph_windows(
     graph_bundle: Dict[str, Any],
     input_size: int,

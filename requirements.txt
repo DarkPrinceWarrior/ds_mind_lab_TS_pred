@@ -10,7 +10,6 @@ node2vec>=0.4.0
 torch>=2.0.0
 pytorch-lightning>=2.0.0
 torch-geometric>=2.7.0
-torch-geometric-temporal>=0.56.2
 tsl>=0.9.1
 deepxde>=1.12.2
 

@@ -13,7 +13,7 @@ try:
     from .features_injection import build_injection_lag_features
     from .features_graph import build_graph_features, build_multigraph_spec
     from .data_validation import WellDataValidator
-    from .graph_dataset import apply_scenario_to_graph_bundle, to_heterodata_snapshots, to_dynamic_hetero_temporal_signal
+    from .graph_dataset import apply_scenario_to_graph_bundle, to_heterodata_snapshots
     from .metrics_extended import calculate_all_metrics, calculate_operational_metrics
     from .metrics_reservoir import compute_all_reservoir_metrics, compute_intervention_response_metrics
     from .logging_config import log_execution_time
@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
     from features_injection import build_injection_lag_features
     from features_graph import build_graph_features, build_multigraph_spec
     from data_validation import WellDataValidator
-    from graph_dataset import apply_scenario_to_graph_bundle, to_heterodata_snapshots, to_dynamic_hetero_temporal_signal
+    from graph_dataset import apply_scenario_to_graph_bundle, to_heterodata_snapshots
     from metrics_extended import calculate_all_metrics, calculate_operational_metrics
     from metrics_reservoir import compute_all_reservoir_metrics, compute_intervention_response_metrics
     from logging_config import log_execution_time
@@ -372,14 +372,8 @@ def _attach_graph_frames(
         config,
     )
     graph_dataset = to_heterodata_snapshots(multigraph_spec, config)
-    temporal_signal = None
-    try:
-        temporal_signal = to_dynamic_hetero_temporal_signal(multigraph_spec, config)
-    except Exception as exc:
-        logger.warning("PyG Temporal signal adapter unavailable: %s", exc)
     frames["multigraph_spec"] = multigraph_spec
     frames["graph_dataset"] = graph_dataset
-    frames["graph_temporal_signal"] = temporal_signal
     return frames
 
 
