@@ -20,6 +20,8 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import PipelineConfig
+from src.graph_dataset import apply_scenario_to_graph_bundle
+from src.metrics_reservoir import compute_scenario_comparison_metrics
 from src.wlpr_pipeline import (
     load_raw_data,
     load_coordinates,
@@ -215,6 +217,33 @@ def run_scenario(raw_df: pd.DataFrame, coords, config, distances, label: str, *,
     return frames, preds, metrics, merged
 
 
+def _scenario_control_residual(frames: dict, scenario: dict, config: PipelineConfig) -> float | None:
+    graph_dataset = frames.get("graph_dataset")
+    if not graph_dataset:
+        return None
+    edited = apply_scenario_to_graph_bundle(graph_dataset, scenario, config)
+    spec = edited.get("multigraph_spec", {})
+    injector_ids = list(spec.get("graph_metadata", {}).get("injector_ids", []))
+    if not injector_ids:
+        return None
+    scenario_well = str(scenario.get("well", "")).strip()
+    if scenario_well not in injector_ids:
+        return None
+    inj_idx = injector_ids.index(scenario_well)
+    cutoff = pd.Timestamp(scenario.get("date"))
+    residuals = []
+    for ds, payload in spec.get("node_dynamic_features_by_time", {}).items():
+        if pd.Timestamp(ds) < cutoff:
+            continue
+        injector_matrix = payload.get("injector")
+        if injector_matrix is None or injector_matrix.shape[0] <= inj_idx:
+            continue
+        residuals.append(float(np.abs(injector_matrix[inj_idx]).mean()))
+    if not residuals:
+        return None
+    return float(np.mean(residuals))
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
@@ -339,6 +368,16 @@ def main():
 
     report = pd.DataFrame(report_rows)
     report = report.sort_values("diff_pct")
+    weight_map_float = {str(key): float(value) for key, value in weight_map.items()}
+    shutin_control_residual = _scenario_control_residual(frames_base, scenario, config) if args.model == "stgnn_pyg" else None
+    scenario_metrics = compute_scenario_comparison_metrics(
+        comp,
+        connected_wells=connected_prods,
+        connectivity_weights=weight_map_float,
+        shutin_control_residual=shutin_control_residual,
+        baseline_allocations=preds_base.attrs.get("edge_allocations"),
+        scenario_allocations=preds_shut.attrs.get("edge_allocations"),
+    )
 
     print("\n" + "=" * 90)
     print(f"СЦЕНАРИЙ: Остановка нагн. скв. {SHUTOFF_WELL} с {SHUTOFF_DATE.strftime('%d.%m.%Y')}")
@@ -359,6 +398,14 @@ def main():
     overall_shut = metrics_shut["overall"]
     print(f"WMAPE базовый:  {overall_base.get('wmape', 0):.4f}%")
     print(f"WMAPE без 34:   {overall_shut.get('wmape', 0):.4f}%")
+    if scenario_metrics.get("scenario_direction_accuracy") is not None:
+        print(f"Direction accuracy (connected wells): {scenario_metrics['scenario_direction_accuracy']:.4f}")
+    if scenario_metrics.get("response_rank_accuracy") is not None:
+        print(f"Response rank accuracy:             {scenario_metrics['response_rank_accuracy']:.4f}")
+    if scenario_metrics.get("connectivity_consistency_score") is not None:
+        print(f"Connectivity consistency score:    {scenario_metrics['connectivity_consistency_score']:.4f}")
+    if scenario_metrics.get("allocation_stability") is not None:
+        print(f"Allocation stability:              {scenario_metrics['allocation_stability']:.4f}")
 
     # --- Generate PDF report ---
     _generate_scenario_pdf(
@@ -378,6 +425,9 @@ def main():
         "connected_producers": connected_prods,
         "baseline_wmape": overall_base.get("wmape"),
         "shutoff_wmape": overall_shut.get("wmape"),
+        "baseline_operational": metrics_base.get("operational", {}),
+        "shutoff_operational": metrics_shut.get("operational", {}),
+        "scenario_metrics": scenario_metrics,
         "most_affected_wells": report.head(3)[["well", "diff_pct"]].to_dict("records"),
     }
     with open(out_dir / "scenario_summary.json", "w") as f:

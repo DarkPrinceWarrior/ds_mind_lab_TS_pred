@@ -14,6 +14,30 @@ logger = logging.getLogger(__name__)
 EPSILON = 1e-9
 
 
+def _grouped_coverage_error(
+    merged: pd.DataFrame,
+    *,
+    group_col: str,
+) -> Optional[float]:
+    if group_col not in merged.columns or not {"y", "cp_lo", "cp_hi"}.issubset(merged.columns):
+        return None
+    alpha = 0.1
+    if "cp_alpha" in merged.columns:
+        alpha_vals = pd.to_numeric(merged["cp_alpha"], errors="coerce").dropna()
+        if not alpha_vals.empty:
+            alpha = float(alpha_vals.median())
+    target = 1.0 - alpha
+    coverage_errors = []
+    for _, group in merged.groupby(group_col):
+        if group.empty:
+            continue
+        covered = ((group["y"] >= group["cp_lo"]) & (group["y"] <= group["cp_hi"])).mean()
+        coverage_errors.append(abs(float(covered) - target))
+    if not coverage_errors:
+        return None
+    return float(np.mean(coverage_errors))
+
+
 def r_squared(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """Calculate R² (coefficient of determination).
     
@@ -351,6 +375,14 @@ def calculate_operational_metrics(
             metrics["connectivity_consistency_score"] = None
     else:
         metrics["connectivity_consistency_score"] = None
+
+    metrics["grouped_coverage_error"] = _grouped_coverage_error(merged, group_col=cluster_col)
+
+    if "allocation" in merged.columns:
+        alloc_std = pd.to_numeric(merged["allocation"], errors="coerce").groupby(merged["unique_id"]).std()
+        metrics["allocation_stability"] = float(alloc_std.mean()) if not alloc_std.empty else None
+    else:
+        metrics["allocation_stability"] = None
 
     return {
         key: float(value) if isinstance(value, (int, float, np.floating)) and np.isfinite(value) else None

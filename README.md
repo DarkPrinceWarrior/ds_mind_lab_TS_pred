@@ -5,6 +5,7 @@
 Поддерживаемые модели:
 - `chronos2` (Amazon Chronos-2, zero-shot через Darts)
 - `xlinear` (обучаемая модель XLinear через NeuralForecast)
+- `stgnn_pyg` (graph-native heterogeneous STGNN на raw PyTorch Geometric)
 
 Текущий CLI entrypoint:
 - `python3 -m src.artifacts`
@@ -15,9 +16,11 @@
 - Строит лаговые признаки закачки с подбором лага и калибровкой ядра весов
 - Строит attention-связность `injector→producer` методом `causal_stage_geo` и признаки `inj_*_attn`
 - Добавляет пространственные, временные и графовые признаки
+- Для `stgnn_pyg` собирает multi-graph `HeteroData` snapshots (`topo/bin/cond/dyn/causal`)
+- Для `stgnn_pyg` обучает relation-specific `HeteroConv` + temporal encoder + graph fusion + physics regularization
 - Делает split train/test по горизонту прогноза
 - Считает walk-forward кросс-валидацию
-- Калибрует prediction intervals через Conformal (ICP/WCP) на out-of-sample residuals из CV
+- Калибрует prediction intervals через grouped Conformal (ICP/WCP) на out-of-sample residuals из CV
 - Строит прогноз, метрики и PDF-отчеты
 - Сохраняет все артефакты в `output-dir`
 
@@ -28,6 +31,10 @@
 - `src/config.py` — `PipelineConfig` с параметрами моделей и признаков
 - `src/features_injection.py` — лаговые признаки закачки и CRM-фильтрация
 - `src/features_graph.py` — графовые признаки и агрегаты соседей
+- `src/graph_dataset.py` — преобразование multigraph-spec в `PyG HeteroData` snapshots
+- `src/models_stgnn.py` — graph-native `stgnn_pyg` модель
+- `src/train_stgnn.py` — отдельный train loop для `stgnn_pyg`
+- `src/physics_regularizers.py` — physics regularizers для graph-native ветки
 - `src/visualization.py` — PDF-отчеты по прогнозу/истории/остаткам
 - `src/visualization_features.py` — PDF-анализ признаков
 - `scripts/scenario_shutoff_34.py` — сценарий “остановка нагнетательной скв. 34”
@@ -47,6 +54,7 @@ python3 -m src.artifacts \
 
 Примечание:
 - При первом запуске `chronos2` модель может скачиваться из Hugging Face.
+- `stgnn_pyg` использует raw `torch-geometric`; `torch-geometric-temporal` в проекте не используется.
 
 ## Примеры запуска
 
@@ -68,6 +76,30 @@ python3 -m src.artifacts \
   --data-path MODEL_23.09.25.csv \
   --distances-path Distance.xlsx \
   --output-dir artifacts_xlinear
+```
+
+STGNN PyG:
+
+```bash
+python3 -m src.artifacts \
+  --model stgnn_pyg \
+  --data-path MODEL_23.09.25.csv \
+  --distances-path Distance.xlsx \
+  --output-dir artifacts_stgnn_pyg
+```
+
+Быстрый smoke-run для `stgnn_pyg`:
+
+```bash
+python3 -m src.artifacts \
+  --model stgnn_pyg \
+  --data-path MODEL_23.09.25.csv \
+  --distances-path Distance.xlsx \
+  --output-dir artifacts_stgnn_pyg_smoke \
+  --disable-cv \
+  --disable-conformal \
+  --stgnn-max-epochs 10 \
+  --stgnn-early-stop-patience 3
 ```
 
 XLinear + Conformal (WCP, 90% PI):
@@ -127,13 +159,19 @@ python3 -m src.artifacts --enable-mlflow --mlflow-uri http://localhost:5000
 mlflow ui
 ```
 
+Scenario graph-edit shutoff:
+
+```bash
+python3 scripts/scenario_shutoff_34.py --model stgnn_pyg
+```
+
 ## CLI параметры
 
 - `--data-path` путь к CSV с промысловыми данными (по умолчанию `MODEL_23.09.25.csv`)
 - `--distances-path` путь к `Distance.xlsx` (координаты + матрица расстояний)
 - `--coords-path` legacy-файл координат (если не задан, берется `--distances-path`)
 - `--output-dir` директория для артефактов (по умолчанию `artifacts`)
-- `--model` тип модели: `chronos2` или `xlinear`
+- `--model` тип модели: `chronos2`, `xlinear` или `stgnn_pyg`
 - `--chronos-model` имя модели на Hugging Face для Chronos-2
 - `--chronos-revision` ревизия/тег модели Chronos-2
 - `--chronos-local-dir` локальная директория кэша Chronos-2
@@ -145,6 +183,8 @@ mlflow ui
 - `--skip-validation` пропустить валидацию данных
 - `--log-level` уровень логов: `DEBUG`, `INFO`, `WARNING`, `ERROR`
 - `--disable-conformal` отключить conformal-интервалы
+- `--disable-cv` отключить walk-forward CV
+- `--cv-folds` переопределить число фолдов walk-forward CV
 - `--conformal-alpha` miscoverage `alpha` (например `0.1` => целевое покрытие 90%)
 - `--conformal-method` метод калибровки: `icp`, `wcp_exp`, `wcp_linear`
 - `--conformal-exp-decay` коэффициент затухания для `wcp_exp` (ближе к `1.0` => медленнее забывание)
@@ -159,6 +199,8 @@ mlflow ui
 - `--inj-attention-future-anchor-strength` якорение future `alpha(t)` к train-last
 - `--inj-attention-geo-condition-strength` сила geo-conditioned blending в prior для attention
 - `--disable-inj-attention-stage-adaptive` отключить stage-adaptive gating (фиксированный mix в `causal_stage_geo`)
+- `--stgnn-max-epochs` переопределить максимум эпох для `stgnn_pyg`
+- `--stgnn-early-stop-patience` переопределить early stopping patience для `stgnn_pyg`
 
 ## Conformal интервалы: что это и зачем
 

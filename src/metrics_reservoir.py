@@ -469,6 +469,103 @@ def compute_intervention_response_metrics(
     else:
         metrics["connectivity_consistency_score"] = None
 
+    if {"y", "cp_lo", "cp_hi", "prod_cluster"}.issubset(merged.columns):
+        alpha = 0.1
+        if "cp_alpha" in merged.columns:
+            alpha_vals = pd.to_numeric(merged["cp_alpha"], errors="coerce").dropna()
+            if not alpha_vals.empty:
+                alpha = float(alpha_vals.median())
+        target = 1.0 - alpha
+        group_errors = []
+        for _, group in merged.groupby("prod_cluster"):
+            covered = ((group["y"] >= group["cp_lo"]) & (group["y"] <= group["cp_hi"])).mean()
+            group_errors.append(abs(float(covered) - target))
+        metrics["grouped_coverage_error"] = float(np.mean(group_errors)) if group_errors else None
+    else:
+        metrics["grouped_coverage_error"] = None
+
+    if "shutin_mask" in merged.columns:
+        mask = pd.to_numeric(merged["shutin_mask"], errors="coerce").fillna(0).astype(bool)
+        metrics["shutin_zero_violation"] = float(np.mean(np.abs(merged.loc[mask, "y_hat"]))) if mask.any() else None
+    else:
+        metrics["shutin_zero_violation"] = None
+
+    if "allocation" in merged.columns:
+        alloc_std = pd.to_numeric(merged["allocation"], errors="coerce").groupby(merged["unique_id"]).std()
+        metrics["allocation_stability"] = float(alloc_std.mean()) if not alloc_std.empty else None
+    else:
+        metrics["allocation_stability"] = None
+
+    return {
+        key: float(value) if isinstance(value, (int, float, np.floating)) and np.isfinite(value) else None
+        for key, value in metrics.items()
+    }
+
+
+def compute_scenario_comparison_metrics(
+    comp: pd.DataFrame,
+    *,
+    connected_wells: Optional[list[str]] = None,
+    connectivity_weights: Optional[Dict[str, float]] = None,
+    shutin_control_residual: Optional[float] = None,
+    baseline_allocations: Optional[pd.DataFrame] = None,
+    scenario_allocations: Optional[pd.DataFrame] = None,
+) -> Dict[str, Optional[float]]:
+    if comp is None or comp.empty or not {"unique_id", "diff", "diff_pct"}.issubset(comp.columns):
+        return {
+            "scenario_direction_accuracy": None,
+            "response_rank_accuracy": None,
+            "connectivity_consistency_score": None,
+            "worst_3_wells_diff_pct": None,
+            "shutin_zero_violation": None,
+            "allocation_stability": None,
+        }
+
+    per_well = (
+        comp.groupby("unique_id")[["diff", "diff_pct"]]
+        .mean()
+        .rename(columns={"diff": "mean_diff", "diff_pct": "mean_diff_pct"})
+    )
+    connected_set = {str(well) for well in (connected_wells or [])}
+    if connected_set:
+        connected_frame = per_well.loc[per_well.index.astype(str).isin(connected_set)].copy()
+    else:
+        connected_frame = per_well.copy()
+
+    metrics: Dict[str, Optional[float]] = {
+        "scenario_direction_accuracy": None,
+        "response_rank_accuracy": None,
+        "connectivity_consistency_score": None,
+        "worst_3_wells_diff_pct": None,
+        "shutin_zero_violation": float(shutin_control_residual) if shutin_control_residual is not None else None,
+        "allocation_stability": None,
+    }
+    if not connected_frame.empty:
+        metrics["scenario_direction_accuracy"] = float((connected_frame["mean_diff"] <= 0.0).mean())
+        worst = connected_frame.reindex(connected_frame["mean_diff_pct"].abs().sort_values(ascending=False).index).head(3)
+        metrics["worst_3_wells_diff_pct"] = float(worst["mean_diff_pct"].abs().mean()) if not worst.empty else None
+
+    if connectivity_weights:
+        weight_series = pd.Series({str(key): float(value) for key, value in connectivity_weights.items()}, name="weight")
+        aligned = connected_frame.join(weight_series, how="inner")
+        if len(aligned) >= 2:
+            impact = -aligned["mean_diff"]
+            metrics["response_rank_accuracy"] = float(stats.spearmanr(aligned["weight"], impact).correlation)
+            metrics["connectivity_consistency_score"] = float(stats.spearmanr(aligned["weight"], impact.abs()).correlation)
+
+    if isinstance(baseline_allocations, pd.DataFrame) and isinstance(scenario_allocations, pd.DataFrame):
+        merge_cols = [col for col in ["graph_type", "inj_id", "prod_id"] if col in baseline_allocations.columns and col in scenario_allocations.columns]
+        if merge_cols and "allocation" in baseline_allocations.columns and "allocation" in scenario_allocations.columns:
+            aligned_alloc = baseline_allocations[merge_cols + ["allocation"]].rename(columns={"allocation": "allocation_base"}).merge(
+                scenario_allocations[merge_cols + ["allocation"]].rename(columns={"allocation": "allocation_scenario"}),
+                on=merge_cols,
+                how="inner",
+            )
+            if not aligned_alloc.empty:
+                metrics["allocation_stability"] = float(
+                    np.mean(np.abs(aligned_alloc["allocation_scenario"] - aligned_alloc["allocation_base"]))
+                )
+
     return {
         key: float(value) if isinstance(value, (int, float, np.floating)) and np.isfinite(value) else None
         for key, value in metrics.items()

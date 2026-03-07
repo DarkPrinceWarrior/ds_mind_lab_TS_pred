@@ -80,37 +80,165 @@ def _history_to_device(history: List[Any], device: torch.device) -> List[Any]:
     return [snapshot.to(device) for snapshot in history]
 
 
-def _future_injector_tensor(multigraph_spec: Dict[str, Any], future_dates: List[pd.Timestamp]) -> Optional[torch.Tensor]:
-    injector_feature_names = list(multigraph_spec.get("graph_metadata", {}).get("injector_feature_names", []))
-    if "wwir" not in injector_feature_names:
+def _node_feature_matrix(
+    multigraph_spec: Dict[str, Any],
+    dates: List[pd.Timestamp],
+    *,
+    node_type: str,
+    feature_name: str,
+) -> Optional[torch.Tensor]:
+    feature_names = list(multigraph_spec.get("graph_metadata", {}).get(f"{node_type}_feature_names", []))
+    if feature_name not in feature_names:
         return None
-    wwir_idx = injector_feature_names.index("wwir")
+    feature_idx = feature_names.index(feature_name)
     values = []
-    for ds in future_dates:
-        matrix = multigraph_spec.get("node_dynamic_features_by_time", {}).get(pd.Timestamp(ds), {}).get("injector")
+    for ds in dates:
+        matrix = multigraph_spec.get("node_dynamic_features_by_time", {}).get(pd.Timestamp(ds), {}).get(node_type)
         if matrix is None:
             continue
-        values.append(np.asarray(matrix[:, [wwir_idx]], dtype=float).sum(axis=0, keepdims=False))
+        values.append(np.asarray(matrix[:, feature_idx], dtype=float))
     if not values:
         return None
-    arr = np.stack(values, axis=0).reshape(len(values), 1)  # [time, 1]
+    arr = np.stack(values, axis=0)
     return torch.as_tensor(arr, dtype=torch.float32)
 
 
-def _edge_allocation_history(sample: Dict[str, Any], graph_type: str = "dyn") -> Optional[torch.Tensor]:
-    allocations = []
-    for snapshot in sample["history"]:
-        for edge_type in snapshot.edge_types:
-            if edge_type[1] != graph_type or edge_type[0] != "injector":
-                continue
-            edge_attr = snapshot[edge_type].edge_attr
-            if edge_attr.numel() == 0:
-                continue
-            allocations.append(edge_attr[:, :1].transpose(0, 1))
-            break
-    if not allocations:
-        return None
-    return torch.stack(allocations, dim=1)  # [1, time, edges]
+def _node_feature_matrix_any(
+    multigraph_spec: Dict[str, Any],
+    dates: List[pd.Timestamp],
+    *,
+    node_type: str,
+    candidates: List[str],
+) -> Optional[torch.Tensor]:
+    for feature_name in candidates:
+        values = _node_feature_matrix(multigraph_spec, dates, node_type=node_type, feature_name=feature_name)
+        if values is not None:
+            return values
+    return None
+
+
+def _select_physics_graph_type(diagnostics: Dict[str, Any]) -> Optional[str]:
+    preferred = ["causal", "dyn", "cond", "bin"]
+    available = set(diagnostics.get("edge_allocations", {}).keys()) & set(diagnostics.get("edge_context", {}).keys())
+    for graph_type in preferred:
+        if graph_type in available:
+            return graph_type
+    return next(iter(available), None) if available else None
+
+
+def _build_physics_inputs(
+    sample: Dict[str, Any],
+    multigraph_spec: Dict[str, Any],
+    diagnostics: Dict[str, Any],
+    device: torch.device,
+) -> Dict[str, Optional[torch.Tensor]]:
+    graph_type = _select_physics_graph_type(diagnostics)
+    if graph_type is None:
+        return {}
+    edge_context = diagnostics.get("edge_context", {}).get(graph_type)
+    latest_alloc = diagnostics.get("edge_allocations", {}).get(graph_type)
+    alloc_history = diagnostics.get("allocation_history", {}).get(graph_type)
+    if edge_context is None or latest_alloc is None:
+        return {}
+
+    history_dates = [pd.Timestamp(ds) for ds in sample.get("history_dates", [])]
+    forecast_dates = [pd.Timestamp(ds) for ds in sample.get("forecast_dates", [])]
+    if not history_dates or not forecast_dates:
+        return {}
+    injector_dates = history_dates + forecast_dates
+    inj_rates = _node_feature_matrix_any(
+        multigraph_spec,
+        injector_dates,
+        node_type="injector",
+        candidates=["wwir"],
+    )
+    if inj_rates is None:
+        return {}
+
+    future_J = _node_feature_matrix_any(
+        multigraph_spec,
+        forecast_dates,
+        node_type="producer",
+        candidates=["pseudo_productivity_index", "productivity_index"],
+    )
+    future_dp = _node_feature_matrix_any(
+        multigraph_spec,
+        forecast_dates,
+        node_type="producer",
+        candidates=["dp_drawdown"],
+    )
+    future_bhp = _node_feature_matrix_any(
+        multigraph_spec,
+        forecast_dates,
+        node_type="producer",
+        candidates=["wbhp", "wthp"],
+    )
+
+    edge_index = edge_context["edge_index"]
+    edge_attr = edge_context.get("edge_attr")
+    edge_feature_names = list(multigraph_spec.get("graph_metadata", {}).get("edge_feature_names", {}).get(graph_type, []))
+    lag_idx = edge_feature_names.index("lag") if "lag" in edge_feature_names else None
+    tau_idx = edge_feature_names.index("tau") if "tau" in edge_feature_names else None
+
+    inj_rates = inj_rates.to(device)
+    latest_alloc = latest_alloc.squeeze(-1).to(device)
+    alloc_history = alloc_history.to(device).unsqueeze(0) if alloc_history is not None else None
+    edge_index = edge_index.to(device)
+    edge_attr = edge_attr.to(device) if edge_attr is not None else None
+
+    horizon = len(forecast_dates)
+    history_len = len(history_dates)
+    num_producers = len(multigraph_spec.get("graph_metadata", {}).get("producer_ids", []))
+    future_alloc = latest_alloc.unsqueeze(0).repeat(horizon, 1)
+    producer_forcing = torch.zeros((horizon, num_producers), device=device, dtype=torch.float32)
+    producer_tau_num = torch.zeros((num_producers,), device=device, dtype=torch.float32)
+    producer_tau_den = torch.zeros((num_producers,), device=device, dtype=torch.float32)
+
+    for edge_pos in range(edge_index.size(1)):
+        inj_idx = int(edge_index[0, edge_pos].item())
+        prod_idx = int(edge_index[1, edge_pos].item())
+        lag_steps = 0
+        tau_value = torch.tensor(1.0, device=device)
+        if edge_attr is not None and edge_attr.numel() > 0:
+            if lag_idx is not None:
+                lag_steps = max(int(round(float(edge_attr[edge_pos, lag_idx].detach().cpu().item()))), 0)
+            if tau_idx is not None:
+                tau_value = torch.clamp(edge_attr[edge_pos, tau_idx].abs(), min=1.0)
+        decay = torch.exp(-torch.tensor(float(lag_steps), device=device) / torch.clamp(tau_value, min=1.0))
+        producer_tau_num[prod_idx] = producer_tau_num[prod_idx] + latest_alloc[edge_pos] * tau_value
+        producer_tau_den[prod_idx] = producer_tau_den[prod_idx] + latest_alloc[edge_pos].abs()
+
+        for step in range(horizon):
+            source_t = min(max(history_len + step - lag_steps, 0), inj_rates.size(0) - 1)
+            producer_forcing[step, prod_idx] = (
+                producer_forcing[step, prod_idx]
+                + future_alloc[step, edge_pos] * decay * inj_rates[source_t, inj_idx]
+            )
+
+    producer_tau = producer_tau_num / torch.clamp(producer_tau_den, min=1e-6)
+    tau_future = producer_tau.unsqueeze(0).repeat(horizon, 1)
+
+    return {
+        "graph_type": graph_type,
+        "producer_forcing": producer_forcing.unsqueeze(0),
+        "alloc_weights": future_alloc.unsqueeze(0),
+        "alloc_history": alloc_history,
+        "allocation_group_index": edge_index[1].detach().clone(),
+        "allocation_num_groups": num_producers,
+        "tau": tau_future.unsqueeze(0),
+        "J": future_J.to(device).unsqueeze(0) if future_J is not None else None,
+        "Vp": future_dp.to(device).unsqueeze(0) if future_dp is not None else None,
+        "bhp": future_bhp.to(device).unsqueeze(0) if future_bhp is not None else None,
+    }
+
+
+def _scenario_shutin_mask(
+    frames: Dict[str, Any],
+    sample: Dict[str, Any],
+    multigraph_spec: Dict[str, Any],
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    return None
 
 
 def _compute_sample_loss(
@@ -118,6 +246,7 @@ def _compute_sample_loss(
     sample: Dict[str, Any],
     loss_fn: nn.Module,
     multigraph_spec: Dict[str, Any],
+    frames: Dict[str, Any],
     config: Any,
     device: torch.device,
     epoch: int,
@@ -135,13 +264,20 @@ def _compute_sample_loss(
         if epoch >= warmup_epochs:
             progress = min(1.0, float(epoch - warmup_epochs + 1) / float(max(int(config.stgnn_max_epochs) - warmup_epochs + 1, 1)))
             schedule = float(config.physics_weight_init) + progress * (float(config.physics_weight_max) - float(config.physics_weight_init))
-        inj_future = _future_injector_tensor(multigraph_spec, sample["forecast_dates"])
-        alloc_history = _edge_allocation_history(sample)
-        if inj_future is not None:
+        physics_inputs = _build_physics_inputs(sample, multigraph_spec, diagnostics, device)
+        if physics_inputs.get("producer_forcing") is not None:
             physics = build_physics_loss_breakdown(
                 pred.transpose(0, 1).unsqueeze(0),
-                inj_future.unsqueeze(0).to(device),
-                alloc_weights=alloc_history.to(device) if alloc_history is not None else None,
+                physics_inputs["producer_forcing"],
+                alloc_weights=physics_inputs.get("alloc_weights"),
+                alloc_history=physics_inputs.get("alloc_history"),
+                allocation_group_index=physics_inputs.get("allocation_group_index"),
+                allocation_num_groups=physics_inputs.get("allocation_num_groups"),
+                shutin_mask=_scenario_shutin_mask(frames, sample, multigraph_spec, device),
+                bhp=physics_inputs.get("bhp"),
+                tau=physics_inputs.get("tau"),
+                J=physics_inputs.get("J"),
+                Vp=physics_inputs.get("Vp"),
                 lambdas={
                     "crm_residual": float(config.physics_lambda_crm),
                     "nonnegative": float(config.physics_lambda_nonneg),
@@ -167,6 +303,7 @@ def _evaluate_samples(
     samples: List[Dict[str, Any]],
     loss_fn: nn.Module,
     multigraph_spec: Dict[str, Any],
+    frames: Dict[str, Any],
     config: Any,
     device: torch.device,
     epoch: int,
@@ -177,7 +314,7 @@ def _evaluate_samples(
     model.eval()
     with torch.no_grad():
         for sample in samples:
-            loss, _, _ = _compute_sample_loss(model, sample, loss_fn, multigraph_spec, config, device, epoch)
+            loss, _, _ = _compute_sample_loss(model, sample, loss_fn, multigraph_spec, frames, config, device, epoch)
             losses.append(float(loss.detach().cpu()))
     return float(np.mean(losses)) if losses else float("inf")
 
@@ -295,14 +432,14 @@ def fit_and_forecast_stgnn(
         train_losses = []
         for sample in train_samples:
             optimizer.zero_grad(set_to_none=True)
-            loss, log_parts, _ = _compute_sample_loss(model, sample, loss_fn, multigraph_spec, config, device, epoch)
+            loss, log_parts, _ = _compute_sample_loss(model, sample, loss_fn, multigraph_spec, frames, config, device, epoch)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             train_losses.append(float(loss.detach().cpu()))
             log_parts["epoch"] = epoch
             physics_logs.append(log_parts)
-        val_loss = _evaluate_samples(model, val_samples or train_samples[-1:], loss_fn, multigraph_spec, config, device, epoch)
+        val_loss = _evaluate_samples(model, val_samples or train_samples[-1:], loss_fn, multigraph_spec, frames, config, device, epoch)
         scheduler.step(val_loss)
         mean_train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
         if epoch == 1 or epoch == max_epochs or epoch % 5 == 0:
@@ -333,7 +470,7 @@ def fit_and_forecast_stgnn(
         model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        _, _, pred = _compute_sample_loss(model, test_sample, loss_fn, multigraph_spec, config, device, epoch=0)
+        _, _, pred = _compute_sample_loss(model, test_sample, loss_fn, multigraph_spec, frames, config, device, epoch=0)
 
     pred_df = _prediction_frame(pred, test_sample["forecast_dates"], graph_bundle["metadata"]["producer_ids"])
     fusion_df = _fusion_weights_frame(model)

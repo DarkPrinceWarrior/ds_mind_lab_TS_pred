@@ -78,7 +78,7 @@ class PipelineConfig:
 
     # Graph feature parameters
     graph_backend: str = "pyg"
-    graph_types: List[str] = field(default_factory=lambda: ["topo", "bin", "cond", "dyn"])
+    graph_types: List[str] = field(default_factory=lambda: ["topo", "bin", "cond", "dyn", "causal"])
     node_types: List[str] = field(default_factory=lambda: ["producer", "injector"])
     use_hetero_graph: bool = True
     graph_n2v_dimensions: int = 4
@@ -224,7 +224,7 @@ class PipelineConfig:
 
     def resolved_graph_types(self) -> List[str]:
         values = [str(item).strip().lower() for item in self.graph_types if str(item).strip()]
-        return values or ["topo", "bin", "cond", "dyn"]
+        return values or ["topo", "bin", "cond", "dyn", "causal"]
 
     def resolved_node_types(self) -> List[str]:
         values = [str(item).strip().lower() for item in self.node_types if str(item).strip()]

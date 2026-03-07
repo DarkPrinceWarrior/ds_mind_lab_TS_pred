@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -25,6 +25,17 @@ def _require_pyg() -> None:
 
 def _relation_key(edge_type: tuple[str, str, str]) -> str:
     return "__".join(edge_type)
+
+
+def _segment_softmax(scores: torch.Tensor, index: torch.Tensor, num_segments: int) -> torch.Tensor:
+    if scores.numel() == 0:
+        return scores
+    weights = torch.zeros_like(scores)
+    for segment in range(max(int(num_segments), 0)):
+        mask = index == segment
+        if torch.any(mask):
+            weights[mask] = torch.softmax(scores[mask], dim=0)
+    return weights
 
 
 def _build_relation_conv(kind: str, hidden_dim: int, edge_dim: int):
@@ -112,6 +123,31 @@ class GraphFusionAttention(nn.Module):
                 for idx, graph_type in enumerate(self.graph_types)
             )
         return fused, weights
+
+
+class EdgeAllocationHead(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LazyLinear(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        src_emb: torch.Tensor,
+        dst_emb: torch.Tensor,
+        edge_attr: Optional[torch.Tensor],
+        group_index: torch.Tensor,
+        num_groups: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if edge_attr is None:
+            edge_attr = src_emb.new_zeros((src_emb.size(0), 0))
+        features = torch.cat([src_emb, dst_emb, edge_attr], dim=-1)
+        logits = self.net(features).squeeze(-1)
+        weights = _segment_softmax(logits, group_index, num_groups).unsqueeze(-1)
+        return weights, logits
 
 
 class MultiGraphHeteroEncoder(nn.Module):
@@ -203,19 +239,71 @@ class STGNNPyG(nn.Module):
         )
         self.fusion = GraphFusionAttention(hidden_dim, self.graph_types)
         self.head = ProducerForecastHead(hidden_dim, int(config.horizon))
+        self.forward_edge_types: Dict[str, tuple[str, str, str]] = {}
+        self.edge_heads = nn.ModuleDict()
+        for graph_type in self.graph_types:
+            for edge_type in self.metadata.get("relation_groups", {}).get(graph_type, []):
+                if edge_type[0] == "injector" and edge_type[2] == "producer":
+                    self.forward_edge_types[graph_type] = edge_type
+                    self.edge_heads[graph_type] = EdgeAllocationHead(hidden_dim)
+                    break
         self.latest_fusion_weights: torch.Tensor | None = None
         self.latest_edge_allocations: Dict[str, torch.Tensor] = {}
+        self.latest_allocation_history: Dict[str, torch.Tensor] = {}
+
+    def _compute_edge_allocations(
+        self,
+        graph_type: str,
+        snapshot: Any,
+        encoded: Dict[str, torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[Dict[str, Any]]]:
+        edge_type = self.forward_edge_types.get(graph_type)
+        if edge_type is None or not hasattr(snapshot[edge_type], "edge_index"):
+            return None, None
+        edge_index = snapshot[edge_type].edge_index
+        if edge_index.numel() == 0:
+            return None, None
+        edge_attr = getattr(snapshot[edge_type], "edge_attr", None)
+        src_emb = encoded["injector"][edge_index[0]]
+        dst_emb = encoded["producer"][edge_index[1]]
+        weights, logits = self.edge_heads[graph_type](
+            src_emb,
+            dst_emb,
+            edge_attr,
+            edge_index[1],
+            encoded["producer"].size(0),
+        )
+        context = {
+            "edge_type": edge_type,
+            "edge_index": edge_index,
+            "edge_attr": edge_attr,
+            "src_index": edge_index[0],
+            "dst_index": edge_index[1],
+            "logits": logits,
+        }
+        return weights, context
 
     def forward(self, history: List[Any]) -> tuple[torch.Tensor, Dict[str, Any]]:
         branch_sequences: Dict[str, Dict[str, List[torch.Tensor]]] = {
             graph_type: {node_type: [] for node_type in self.node_types}
             for graph_type in self.graph_types
         }
+        allocation_sequences: Dict[str, List[torch.Tensor]] = {
+            graph_type: []
+            for graph_type in self.graph_types
+            if graph_type in self.edge_heads
+        }
+        edge_context: Dict[str, Dict[str, Any]] = {}
         for snapshot in history:
             for graph_type in self.graph_types:
                 encoded = self.encoder.forward_branch(snapshot, graph_type)
                 for node_type in self.node_types:
                     branch_sequences[graph_type][node_type].append(encoded[node_type])
+                allocation_weights, context = self._compute_edge_allocations(graph_type, snapshot, encoded)
+                if allocation_weights is not None:
+                    allocation_sequences.setdefault(graph_type, []).append(allocation_weights)
+                if context is not None:
+                    edge_context[graph_type] = context
 
         branch_embeddings: Dict[str, Dict[str, torch.Tensor]] = {}
         for graph_type in self.graph_types:
@@ -229,22 +317,20 @@ class STGNNPyG(nn.Module):
         pred = self.head(fused["producer"])
 
         edge_allocations: Dict[str, torch.Tensor] = {}
-        last_snapshot = history[-1]
-        for graph_type in self.graph_types:
-            allocations: List[torch.Tensor] = []
-            for edge_type in self.metadata.get("relation_groups", {}).get(graph_type, []):
-                if edge_type[0] != "injector" or not hasattr(last_snapshot[edge_type], "edge_attr"):
-                    continue
-                edge_attr = last_snapshot[edge_type].edge_attr
-                if edge_attr.numel() == 0:
-                    continue
-                allocations.append(edge_attr[:, :1])
-            if allocations:
-                edge_allocations[graph_type] = torch.cat(allocations, dim=0)
+        allocation_history: Dict[str, torch.Tensor] = {}
+        for graph_type, sequence in allocation_sequences.items():
+            if not sequence:
+                continue
+            history_tensor = torch.stack(sequence, dim=0).squeeze(-1)
+            allocation_history[graph_type] = history_tensor
+            edge_allocations[graph_type] = sequence[-1]
         self.latest_edge_allocations = edge_allocations
+        self.latest_allocation_history = allocation_history
         diagnostics = {
             "fusion_weights": fusion_weights,
             "edge_allocations": edge_allocations,
+            "allocation_history": allocation_history,
             "branch_embeddings": branch_embeddings,
+            "edge_context": edge_context,
         }
         return pred, diagnostics

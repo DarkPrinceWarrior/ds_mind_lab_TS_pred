@@ -21,16 +21,16 @@
 
 ## 1. Обзор системы
 
-Пайплайн предназначен для прогнозирования месячного дебита нефти (`wlpr`, тонн/месяц) по добывающим скважинам нефтяного месторождения. Система использует foundation-модель временных рядов **Amazon Chronos-2** (zero-shot, без дообучения) с обогащением входных данных графовыми, пространственными и физическими ковариатами.
+Пайплайн предназначен для прогнозирования месячного дебита нефти (`wlpr`, тонн/месяц) по добывающим скважинам нефтяного месторождения. В репозитории поддерживаются три model branches: **Amazon Chronos-2** как zero-shot baseline, **XLinear** как обучаемый tabular/time-series baseline и **STGNN PyG** как graph-native heterogeneous spatiotemporal branch на raw PyTorch Geometric.
 
 **Ключевые особенности:**
-- Foundation-модель Chronos-2 работает в режиме zero-shot (без обучения на целевых данных)
-- Кросс-обучение (cross-learning): все скважины подаются как единый мультивариативный ряд
-- Графовое обогащение: скважины связаны через пространственный граф с DTW-подобием и кластеризацией
-- Суперпозиция закачки: вклад каждой нагнетательной скважины моделируется индивидуально
-- Физические признаки: индекс продуктивности, перепад давления
-- Вероятностное прогнозирование: квантильная регрессия с доверительным интервалом 80%
-- Walk-forward кросс-валидация с полной перестройкой признаков на каждом фолде
+- Baseline-ветки `chronos2` и `xlinear` сохранены для честного сравнения
+- Graph-native ветка `stgnn_pyg` строит hetero multi-graph snapshots `topo/bin/cond/dyn/causal`
+- Вклад нагнетательных моделируется не только flat covariates, но и как typed interwell edges
+- Для `stgnn_pyg` используются relation-specific `HeteroConv`, temporal encoder, graph fusion attention и soft physics regularization
+- Grouped conformal calibration поддерживает профили по `well/cluster/regime`
+- Сценарный анализ для `stgnn_pyg` выполняется как graph-edit, а не только как редактирование covariates
+- Walk-forward кросс-валидация с полной перестройкой leakage-sensitive features на каждом фолде
 
 **Горизонт прогнозирования:** 6 месяцев  
 **Частота данных:** месячная (`MS` — начало месяца)  
@@ -40,7 +40,7 @@
 
 ## 2. Входные данные
 
-### 2.1. Промысловые данные (`MODEL_22.09.25.csv`)
+### 2.1. Промысловые данные (`MODEL_23.09.25.csv`)
 
 CSV-файл с разделителем `;`, содержащий суточные/месячные показатели по всем скважинам (добывающим и нагнетательным).
 
@@ -592,14 +592,18 @@ src/
 │                                 # superposition (top-N contributions), multiscale lags
 ├── logging_config.py             # Настройка логирования
 ├── metrics_extended.py           # Все метрики (MAE, RMSE, MAPE, WMAPE, R², NSE, KGE, ...)
-├── metrics_reservoir.py          # Reservoir-specific метрики
+├── metrics_reservoir.py          # Reservoir-specific и scenario-comparison метрики
 ├── mlflow_tracking.py            # MLflow трекинг экспериментов
-├── physics_loss_advanced.py      # Физический лосс (не используется с Chronos-2)
+├── graph_dataset.py              # Multi-graph spec -> PyG HeteroData snapshots
+├── models_stgnn.py               # STGNN PyG: hetero encoder + temporal + fusion + edge head
+├── train_stgnn.py                # Отдельный train loop для stgnn_pyg
+├── physics_regularizers.py       # Graph-native physics regularizers
+├── physics_loss_advanced.py      # Legacy physics loss для baseline-экспериментов
 ├── utils_lag.py                  # Кросс-корреляция, CRM-фильтр, оценка окна лага
 ├── visualization.py              # PDF-визуализация прогнозов, истории, остатков
 ├── visualization_features.py     # PDF-анализ признаков (7 страниц)
 └── wlpr_pipeline.py              # Основной пайплайн: загрузка → обработка → признаки →
-                                  # Chronos-2 → CV → оценка
+                                  # baseline/STGNN → CV → оценка
 ```
 
 ### Последовательность вызовов (основной поток)
@@ -626,7 +630,7 @@ main() [artifacts.py]
   │           └── DTW neighbor aggregation
   ├── run_walk_forward_validation()      # 6-fold walk-forward CV
   │     └── (полная перестройка на каждом фолде)
-  ├── train_and_forecast()               # Финальный прогноз Chronos-2
+  ├── train_and_forecast()               # Dispatch: Chronos-2 / XLinear / STGNN PyG
   ├── evaluate_predictions()             # Метрики
   └── save_artifacts()                   # PDF, JSON, CSV
 ```
@@ -644,7 +648,7 @@ main() [artifacts.py]
 | `horizon` | 6 | Горизонт прогноза (месяцев) |
 | `freq` | `"MS"` | Частота временного ряда (начало месяца) |
 | `min_history` | 60 | Минимальная длина истории для включения скважины |
-| `input_size` | 48 | Базовая длина входного окна Chronos-2 |
+| `input_size` | 36 | Базовая длина исторического окна |
 | `random_seed` | 42 | Зерно генератора случайных чисел |
 
 ### 12.2. Кросс-валидация
@@ -684,8 +688,22 @@ main() [artifacts.py]
 | `graph_sparsify` | True | Спарсификация графа |
 | `graph_sparsify_max_k` | 4 | Максимум кластеров K-Means |
 | `graph_sparsify_inter_quantile` | 0.5 | Порог обрезки межкластерных рёбер |
+| `graph_types` | `["topo","bin","cond","dyn","causal"]` | Graph views для `stgnn_pyg` |
 
-### 12.6. Chronos-2
+### 12.6. STGNN PyG
+
+| Параметр | Значение | Описание |
+|----------|----------|----------|
+| `model_type` | `"stgnn_pyg"` | Graph-native heterogeneous branch |
+| `stgnn_hidden_dim` | 64 | Ширина скрытого пространства |
+| `stgnn_layers` | 2 | Число relation-specific graph layers |
+| `stgnn_temporal_backbone` | `"gru"` | Temporal encoder поверх node histories |
+| `stgnn_graph_fusion` | `"attention"` | Adaptive fusion across graph views |
+| `stgnn_max_epochs` | 120 | Максимум эпох обучения |
+| `physics_loss_enabled` | True | Включение graph-native physics regularization |
+| `conformal_group_key` | `"well_cluster"` | Grouped conformal calibration key |
+
+### 12.7. Chronos-2
 
 | Параметр | Значение | Описание |
 |----------|----------|----------|
@@ -707,17 +725,53 @@ pip install -r requirements.txt
 
 ### 13.2. Команда запуска
 
+Chronos-2 baseline:
+
 ```bash
 python -m src.artifacts \
-    --data-path MODEL_22.09.25.csv \
-    --coords-path coords.txt \
-    --distances-path well_distances.xlsx \
+    --model chronos2 \
+    --data-path MODEL_23.09.25.csv \
+    --distances-path Distance.xlsx \
     --output-dir artifacts
+```
+
+XLinear baseline:
+
+```bash
+python -m src.artifacts \
+    --model xlinear \
+    --data-path MODEL_23.09.25.csv \
+    --distances-path Distance.xlsx \
+    --output-dir artifacts_xlinear
+```
+
+STGNN PyG:
+
+```bash
+python -m src.artifacts \
+    --model stgnn_pyg \
+    --data-path MODEL_23.09.25.csv \
+    --distances-path Distance.xlsx \
+    --output-dir artifacts_stgnn_pyg
+```
+
+Быстрый smoke-run для STGNN:
+
+```bash
+python -m src.artifacts \
+    --model stgnn_pyg \
+    --data-path MODEL_23.09.25.csv \
+    --distances-path Distance.xlsx \
+    --output-dir artifacts_stgnn_pyg_smoke \
+    --disable-cv \
+    --disable-conformal \
+    --stgnn-max-epochs 10 \
+    --stgnn-early-stop-patience 3
 ```
 
 ### 13.3. Выходные артефакты
 
-Все артефакты сохраняются в директорию `artifacts/`:
+Все артефакты сохраняются в директорию `artifacts*/`:
 
 | Файл | Описание |
 |------|----------|
@@ -729,6 +783,10 @@ python -m src.artifacts \
 | `predictions.csv` | Таблица прогнозов с квантилями |
 | `data_quality_report.json` | Отчёт о качестве данных |
 | `cv_results.json` | Результаты кросс-валидации по фолдам |
+| `graph_fusion_weights.parquet` | Веса adaptive fusion по graph views (`stgnn_pyg`) |
+| `edge_allocations.parquet` | Learned edge allocations по `injector -> producer` (`stgnn_pyg`) |
+| `scenario_edge_deltas.parquet` | Изменения graph edges в сценариях (`stgnn_pyg`) |
+| `grouped_conformal_profile.json` | Grouped conformal calibration profile |
 
 ---
 

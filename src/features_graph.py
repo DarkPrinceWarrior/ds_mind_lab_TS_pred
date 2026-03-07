@@ -975,6 +975,8 @@ def build_multigraph_spec(
                         reverse_type = (dst_type, f"rev_{relation}", src_type)
                         attrs_by_type[reverse_type] = edge_attr.copy()
 
+    actual_graph_types = [graph_type for graph_type in graph_types if graph_type in edge_index_dict_by_graph]
+
     graph_metadata = {
         "producer_ids": producer_ids,
         "injector_ids": injector_ids,
@@ -984,10 +986,11 @@ def build_multigraph_spec(
         "injector_static_feature_names": list(injector_static.columns),
         "edge_feature_names": edge_feature_names,
         "relation_groups": relation_groups,
+        "graph_types": actual_graph_types,
     }
 
     return {
-        "graph_types": graph_types,
+        "graph_types": actual_graph_types,
         "dates": [pd.Timestamp(ds) for ds in dates],
         "node_static_features": {
             "producer": producer_static.to_numpy(dtype=float) if not producer_static.empty else np.zeros((len(producer_ids), 0), dtype=float),
