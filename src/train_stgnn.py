@@ -649,9 +649,8 @@ def fit_and_forecast_stgnn(
             device_ids=[runtime.local_rank] if device.type == "cuda" else None,
             output_device=runtime.local_rank if device.type == "cuda" else None,
             broadcast_buffers=False,
-            find_unused_parameters=False,
+            find_unused_parameters=True,
             gradient_as_bucket_view=True,
-            static_graph=True,
         )
     else:
         model = model_core
