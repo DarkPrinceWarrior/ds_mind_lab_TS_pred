@@ -387,6 +387,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable automatic mixed precision (bf16 autocast on CUDA) for STGNN PyG training",
     )
+    parser.add_argument(
+        "--physics-warmup-epochs",
+        type=int,
+        default=None,
+        help="Override warmup epochs before staged physics regularization reaches full weight",
+    )
+    parser.add_argument(
+        "--physics-weight-max",
+        type=float,
+        default=None,
+        help="Override maximum staged physics loss weight",
+    )
+    parser.add_argument(
+        "--physics-lambda-crm",
+        type=float,
+        default=None,
+        help="Override CRM residual coefficient inside physics loss",
+    )
+    parser.add_argument(
+        "--physics-lambda-simplex",
+        type=float,
+        default=None,
+        help="Override simplex regularization coefficient for edge allocations",
+    )
+    parser.add_argument(
+        "--physics-lambda-nonneg",
+        type=float,
+        default=None,
+        help="Override non-negativity regularization coefficient for physics loss",
+    )
+    parser.add_argument(
+        "--physics-lambda-smoothness",
+        type=float,
+        default=None,
+        help="Override temporal smoothness regularization coefficient for physics loss",
+    )
     return parser.parse_args()
 
 
@@ -475,6 +511,18 @@ def main() -> None:
         config.stgnn_num_workers = int(args.stgnn_num_workers)
     if args.stgnn_use_amp:
         config.stgnn_use_amp = True
+    if args.physics_warmup_epochs is not None:
+        config.physics_warmup_epochs = int(args.physics_warmup_epochs)
+    if args.physics_weight_max is not None:
+        config.physics_weight_max = float(args.physics_weight_max)
+    if args.physics_lambda_crm is not None:
+        config.physics_lambda_crm = float(args.physics_lambda_crm)
+    if args.physics_lambda_simplex is not None:
+        config.physics_lambda_simplex = float(args.physics_lambda_simplex)
+    if args.physics_lambda_nonneg is not None:
+        config.physics_lambda_nonneg = float(args.physics_lambda_nonneg)
+    if args.physics_lambda_smoothness is not None:
+        config.physics_lambda_smoothness = float(args.physics_lambda_smoothness)
 
     if not args.disable_cache:
         try:
