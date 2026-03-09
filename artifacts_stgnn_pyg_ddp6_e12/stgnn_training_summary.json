@@ -1,0 +1,11 @@
+{
+  "train_windows": 139,
+  "val_windows": 1,
+  "best_val_loss": 110.15519714355469,
+  "epochs_trained": 12,
+  "device": "cuda:0",
+  "world_size": 6,
+  "ddp_enabled": true,
+  "batch_size": 2,
+  "amp_enabled": false
+}
