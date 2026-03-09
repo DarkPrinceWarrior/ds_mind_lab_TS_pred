@@ -38,6 +38,15 @@ def _segment_softmax(scores: torch.Tensor, index: torch.Tensor, num_segments: in
     return weights
 
 
+def _split_by_batch(values: torch.Tensor, batch_index: Optional[torch.Tensor]) -> torch.Tensor:
+    if batch_index is None:
+        return values
+    num_graphs = int(batch_index.max().item()) + 1 if batch_index.numel() else 1
+    counts = torch.bincount(batch_index, minlength=num_graphs).tolist()
+    chunks = torch.split(values, counts, dim=0)
+    return torch.stack(chunks, dim=0)
+
+
 def _build_relation_conv(kind: str, hidden_dim: int, edge_dim: int):
     _require_pyg()
     normalized = str(kind or "sage").strip().lower()
@@ -281,6 +290,20 @@ class STGNNPyG(nn.Module):
             "dst_index": edge_index[1],
             "logits": logits,
         }
+        producer_batch = getattr(snapshot["producer"], "batch", None)
+        injector_batch = getattr(snapshot["injector"], "batch", None)
+        if producer_batch is not None and injector_batch is not None:
+            num_graphs = int(producer_batch.max().item()) + 1 if producer_batch.numel() else 1
+            prod_counts = torch.bincount(producer_batch, minlength=num_graphs)
+            inj_counts = torch.bincount(injector_batch, minlength=num_graphs)
+            prod_ptr = torch.cat([prod_counts.new_zeros(1), torch.cumsum(prod_counts, dim=0)], dim=0)
+            inj_ptr = torch.cat([inj_counts.new_zeros(1), torch.cumsum(inj_counts, dim=0)], dim=0)
+            edge_batch = producer_batch[edge_index[1]]
+            context["edge_batch"] = edge_batch
+            context["src_batch"] = injector_batch[edge_index[0]]
+            context["dst_batch"] = edge_batch
+            context["src_local_index"] = edge_index[0] - inj_ptr[injector_batch[edge_index[0]]]
+            context["dst_local_index"] = edge_index[1] - prod_ptr[edge_batch]
         return weights, context
 
     def forward(self, history: List[Any]) -> tuple[torch.Tensor, Dict[str, Any]]:
@@ -315,6 +338,8 @@ class STGNNPyG(nn.Module):
         fused, fusion_weights = self.fusion(branch_embeddings)
         self.latest_fusion_weights = fusion_weights.detach()
         pred = self.head(fused["producer"])
+        producer_batch = getattr(history[-1]["producer"], "batch", None)
+        pred = _split_by_batch(pred, producer_batch)
 
         edge_allocations: Dict[str, torch.Tensor] = {}
         allocation_history: Dict[str, torch.Tensor] = {}
@@ -332,5 +357,6 @@ class STGNNPyG(nn.Module):
             "allocation_history": allocation_history,
             "branch_embeddings": branch_embeddings,
             "edge_context": edge_context,
+            "producer_batch": producer_batch,
         }
         return pred, diagnostics

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -59,6 +60,12 @@ except ImportError:  # pragma: no cover
     from visualization_features import generate_feature_analysis_pdf
 
 logger = logging.getLogger(__name__)
+
+
+def _dist_runtime_from_env() -> tuple[int, int, bool]:
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    rank = int(os.getenv("RANK", "0"))
+    return rank, world_size, rank == 0
 
 
 def save_artifacts(
@@ -350,11 +357,29 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override early stopping patience for STGNN PyG training",
     )
+    parser.add_argument(
+        "--stgnn-batch-size",
+        type=int,
+        default=None,
+        help="Override mini-batch size for STGNN PyG training",
+    )
+    parser.add_argument(
+        "--stgnn-num-workers",
+        type=int,
+        default=None,
+        help="Override DataLoader workers for STGNN PyG training",
+    )
+    parser.add_argument(
+        "--stgnn-use-amp",
+        action="store_true",
+        help="Enable automatic mixed precision (bf16 autocast on CUDA) for STGNN PyG training",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    dist_rank, dist_world_size, dist_is_main = _dist_runtime_from_env()
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -373,6 +398,8 @@ def main() -> None:
     logger.info("=" * 80)
     logger.info("Starting WLPR Forecasting Pipeline (%s)", args.model.upper())
     logger.info("Timestamp: %s", datetime.now().isoformat())
+    if dist_world_size > 1:
+        logger.info("Distributed launch detected: rank=%d, world_size=%d", dist_rank, dist_world_size)
     logger.info("=" * 80)
 
     if not args.data_path.exists():
@@ -429,6 +456,12 @@ def main() -> None:
         config.stgnn_max_epochs = int(args.stgnn_max_epochs)
     if args.stgnn_early_stop_patience is not None:
         config.stgnn_early_stop_patience = int(args.stgnn_early_stop_patience)
+    if args.stgnn_batch_size is not None:
+        config.stgnn_batch_size = int(args.stgnn_batch_size)
+    if args.stgnn_num_workers is not None:
+        config.stgnn_num_workers = int(args.stgnn_num_workers)
+    if args.stgnn_use_amp:
+        config.stgnn_use_amp = True
 
     if not args.disable_cache:
         try:
@@ -442,7 +475,9 @@ def main() -> None:
         logger.info("Caching disabled")
 
     tracker = None
-    if args.enable_mlflow:
+    if args.enable_mlflow and not dist_is_main:
+        logger.info("Skipping MLflow on non-zero DDP rank %d", dist_rank)
+    if args.enable_mlflow and dist_is_main:
         tracker = create_tracker(
             config=config,
             run_name=f"wlpr_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -503,6 +538,11 @@ def main() -> None:
             )
 
     preds = train_and_forecast(frames, config)
+    if dist_world_size > 1 and not dist_is_main and args.model == "stgnn_pyg":
+        logger.info("Rank %d finished distributed STGNN work; rank 0 will run final evaluation and artifact export.", dist_rank)
+        if tracker:
+            tracker.end_run()
+        return
     conformal_profile = cv_results.get("conformal_profile") if isinstance(cv_results, dict) else None
     if config.conformal_enabled and conformal_profile:
         preds = apply_conformal_intervals(preds, conformal_profile, horizon=config.horizon)

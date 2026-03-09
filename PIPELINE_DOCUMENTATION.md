@@ -769,6 +769,25 @@ python -m src.artifacts \
     --stgnn-early-stop-patience 3
 ```
 
+Multi-GPU `torchrun` для single-node сервера (`6xA100`):
+
+```bash
+torchrun --standalone --nproc_per_node=6 -m src.artifacts \
+  --model stgnn_pyg \
+  --data-path MODEL_23.09.25.csv \
+  --distances-path Distance.xlsx \
+  --output-dir artifacts_stgnn_pyg_ddp \
+  --disable-cv \
+  --disable-conformal \
+  --stgnn-max-epochs 40 \
+  --stgnn-early-stop-patience 8 \
+  --stgnn-batch-size 16 \
+  --stgnn-num-workers 8 \
+  --stgnn-use-amp
+```
+
+Замечание: multi-GPU путь использует `DistributedDataParallel`, mini-batching temporal windows и запись артефактов только на `rank 0`.
+
 ### 13.3. Выходные артефакты
 
 Все артефакты сохраняются в директорию `artifacts*/`:
