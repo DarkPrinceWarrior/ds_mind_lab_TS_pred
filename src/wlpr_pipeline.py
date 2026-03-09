@@ -1177,9 +1177,9 @@ def merge_forecast_frame(pred_df: pd.DataFrame, test_df: pd.DataFrame) -> pd.Dat
         c for c in pred_df.columns if c.startswith("q_") or c.startswith("cp_")
     ]
     pred_cols = list(dict.fromkeys(pred_cols))
-    preserved_test_cols = [
+    preserved_test_cols = ["unique_id", "ds"] + [
         col for col in test_df.columns
-        if col not in {"y_hat"} and col not in pred_cols
+        if col not in {"unique_id", "ds", "y_hat"} and col not in pred_cols
     ]
     merged = test_df[preserved_test_cols].merge(
         pred_df[pred_cols], on=["unique_id", "ds"], how="inner",
