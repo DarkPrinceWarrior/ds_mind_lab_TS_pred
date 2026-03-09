@@ -499,7 +499,7 @@ def _prediction_frame(
     forecast_dates: List[pd.Timestamp],
     producer_ids: List[str],
 ) -> pd.DataFrame:
-    pred_np = pred.detach().cpu().numpy()
+    pred_np = pred.detach().float().cpu().numpy()
     records = []
     for prod_idx, well in enumerate(producer_ids):
         for step, ds in enumerate(forecast_dates):
@@ -510,7 +510,7 @@ def _prediction_frame(
 def _fusion_weights_frame(model: STGNNPyG) -> pd.DataFrame:
     if model.latest_fusion_weights is None:
         return pd.DataFrame(columns=["graph_type", "weight"])
-    weights = model.latest_fusion_weights.detach().cpu().numpy()
+    weights = model.latest_fusion_weights.detach().float().cpu().numpy()
     return pd.DataFrame({"graph_type": model.graph_types, "weight": weights})
 
 
@@ -518,7 +518,7 @@ def _edge_allocations_frame(model: STGNNPyG, multigraph_spec: Dict[str, Any]) ->
     pair_table = multigraph_spec.get("pair_table", pd.DataFrame())
     rows = []
     for graph_type, values in (model.latest_edge_allocations or {}).items():
-        alloc = values.detach().cpu().numpy().reshape(-1)
+        alloc = values.detach().float().cpu().numpy().reshape(-1)
         if pair_table is not None and not pair_table.empty and len(pair_table) >= len(alloc):
             subset = pair_table.iloc[: len(alloc)]
             for idx, value in enumerate(alloc):
