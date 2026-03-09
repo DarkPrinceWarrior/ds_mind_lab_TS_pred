@@ -1,7 +1,0 @@
-{
-  "train_windows": 139,
-  "val_windows": 1,
-  "best_val_loss": 108.95869445800781,
-  "epochs_trained": 10,
-  "device": "cuda"
-}
