@@ -16,6 +16,11 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
+
+try:
     from torch_geometric.data import Batch
 except ImportError:  # pragma: no cover
     Batch = None
@@ -696,16 +701,31 @@ def fit_and_forecast_stgnn(
             train_sampler.set_epoch(epoch)
         model.train()
         train_losses = []
-        for batch in train_loader:
+        train_iter = train_loader
+        progress_bar = None
+        if runtime.is_main and tqdm is not None:
+            progress_bar = tqdm(
+                train_loader,
+                desc=f"STGNN epoch {epoch}/{max_epochs}",
+                leave=False,
+                dynamic_ncols=True,
+            )
+            train_iter = progress_bar
+        for batch_idx, batch in enumerate(train_iter, start=1):
             optimizer.zero_grad(set_to_none=True)
             loss, log_parts, _ = _compute_batch_loss(model, batch, loss_fn, multigraph_spec, frames, config, device, epoch)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
-            train_losses.append(float(loss.detach().cpu()))
+            loss_value = float(loss.detach().cpu())
+            train_losses.append(loss_value)
+            if progress_bar is not None:
+                progress_bar.set_postfix(loss=f"{loss_value:.4f}", batch=batch_idx, refresh=False)
             if runtime.is_main:
                 log_parts["epoch"] = epoch
                 physics_logs.append(log_parts)
+        if progress_bar is not None:
+            progress_bar.close()
 
         mean_train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
         mean_train_loss = _all_reduce_mean(mean_train_loss, runtime, device)
@@ -716,7 +736,7 @@ def fit_and_forecast_stgnn(
         val_loss = _broadcast_float(val_loss, runtime, device)
         scheduler.step(val_loss)
 
-        if runtime.is_main and (epoch == 1 or epoch == max_epochs or epoch % 5 == 0):
+        if runtime.is_main:
             logger.info(
                 "STGNN epoch %d/%d: train_loss=%.5f, val_loss=%.5f, best_val=%.5f",
                 epoch,
