@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import pickle
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -66,6 +67,18 @@ def _dist_runtime_from_env() -> tuple[int, int, bool]:
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
     return rank, world_size, rank == 0
+
+
+def _wait_for_file(path: Path, timeout_s: int = 7200, poll_s: float = 2.0) -> None:
+    start = time.perf_counter()
+    while not path.exists():
+        if (time.perf_counter() - start) > timeout_s:
+            raise TimeoutError(f"Timed out waiting for file: {path}")
+        time.sleep(poll_s)
+
+
+def _ddp_frames_cache_path(output_dir: Path) -> Path:
+    return output_dir / ".ddp_frames.pkl"
 
 
 def save_artifacts(
@@ -493,49 +506,70 @@ def main() -> None:
             })
             logger.info("MLflow tracking enabled")
 
-    raw_df = load_raw_data(args.data_path, validate=not args.skip_validation)
-
-    if not args.skip_validation:
-        try:
-            coords_temp = load_coordinates(coords_source)
-            quality_report = validate_and_report(
-                raw_df,
-                coords=coords_temp,
-                save_report=True,
-                output_path=str(output_dir),
-            )
-            if tracker:
-                tracker.log_dict(quality_report.to_dict(), "data_quality_report")
-                tracker.log_metrics({
-                    "data_total_rows": quality_report.total_rows,
-                    "data_total_wells": quality_report.total_wells,
-                    "data_duplicate_rows": quality_report.duplicate_rows,
-                })
-        except Exception as exc:
-            logger.warning("Data validation failed: %s", exc)
-
-    coords = load_coordinates(coords_source)
+    ddp_graph_mode = dist_world_size > 1 and args.model == "stgnn_pyg"
+    frames_cache_path = _ddp_frames_cache_path(output_dir)
+    coords = None
     distances = None
-    if args.distances_path and args.distances_path.exists():
-        distances = load_distance_matrix(args.distances_path)
-    elif args.distances_path:
-        logger.warning(
-            "Distance file not found at %s. Falling back to coordinate-based distances.",
-            args.distances_path,
-        )
+    cv_results = {}
 
-    frames = prepare_model_frames(raw_df, coords, config, distances=distances)
+    if ddp_graph_mode and not dist_is_main:
+        logger.info("Rank %d waiting for rank 0 prepared frames: %s", dist_rank, frames_cache_path)
+        _wait_for_file(frames_cache_path)
+        with open(frames_cache_path, "rb") as handle:
+            payload = pickle.load(handle)
+        frames = payload["frames"]
+        coords = payload.get("coords")
+        distances = payload.get("distances")
+        logger.info("Rank %d loaded cached frames from rank 0", dist_rank)
+    else:
+        raw_df = load_raw_data(args.data_path, validate=not args.skip_validation)
 
-    cv_results = run_walk_forward_validation(
-        frames, coords, config, distances=distances,
-    )
-    if tracker and cv_results:
-        tracker.log_dict(cv_results, "cv_results")
-        if "aggregate" in cv_results and cv_results["aggregate"]:
-            tracker.log_metrics(
-                {f"cv_{k}": v for k, v in cv_results["aggregate"].items() if v is not None},
-                step=0,
+        if not args.skip_validation:
+            try:
+                coords_temp = load_coordinates(coords_source)
+                quality_report = validate_and_report(
+                    raw_df,
+                    coords=coords_temp,
+                    save_report=True,
+                    output_path=str(output_dir),
+                )
+                if tracker:
+                    tracker.log_dict(quality_report.to_dict(), "data_quality_report")
+                    tracker.log_metrics({
+                        "data_total_rows": quality_report.total_rows,
+                        "data_total_wells": quality_report.total_wells,
+                        "data_duplicate_rows": quality_report.duplicate_rows,
+                    })
+            except Exception as exc:
+                logger.warning("Data validation failed: %s", exc)
+
+        coords = load_coordinates(coords_source)
+        distances = None
+        if args.distances_path and args.distances_path.exists():
+            distances = load_distance_matrix(args.distances_path)
+        elif args.distances_path:
+            logger.warning(
+                "Distance file not found at %s. Falling back to coordinate-based distances.",
+                args.distances_path,
             )
+
+        frames = prepare_model_frames(raw_df, coords, config, distances=distances)
+        if ddp_graph_mode and dist_is_main:
+            with open(frames_cache_path, "wb") as handle:
+                pickle.dump({"frames": frames, "coords": coords, "distances": distances}, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            logger.info("Rank 0 cached prepared frames for DDP: %s", frames_cache_path)
+
+    if not (ddp_graph_mode and not dist_is_main):
+        cv_results = run_walk_forward_validation(
+            frames, coords, config, distances=distances,
+        )
+        if tracker and cv_results:
+            tracker.log_dict(cv_results, "cv_results")
+            if "aggregate" in cv_results and cv_results["aggregate"]:
+                tracker.log_metrics(
+                    {f"cv_{k}": v for k, v in cv_results["aggregate"].items() if v is not None},
+                    step=0,
+                )
 
     preds = train_and_forecast(frames, config)
     if dist_world_size > 1 and not dist_is_main and args.model == "stgnn_pyg":

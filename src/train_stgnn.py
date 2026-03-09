@@ -625,6 +625,18 @@ def fit_and_forecast_stgnn(
     )
 
     model_core = STGNNPyG(graph_bundle["metadata"], config).to(device)
+    init_loader = DataLoader(
+        train_dataset,
+        batch_size=min(batch_size, len(train_dataset)),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=pin_memory,
+        collate_fn=_collate_temporal_windows,
+    )
+    init_batch = next(iter(init_loader))
+    with torch.no_grad():
+        _ = model_core(_history_to_device(init_batch["history"], device))
+
     if runtime.enabled:
         model: nn.Module = DDP(
             model_core,
