@@ -627,17 +627,23 @@ def fit_and_forecast_stgnn(
     model_core = STGNNPyG(graph_bundle["metadata"], config).to(device)
     init_loader = DataLoader(
         train_dataset,
-        batch_size=min(batch_size, len(train_dataset)),
+        batch_size=1,
         shuffle=False,
         num_workers=0,
         pin_memory=pin_memory,
         collate_fn=_collate_temporal_windows,
     )
     init_batch = next(iter(init_loader))
+    if runtime.is_main:
+        logger.info("STGNN init: running lazy-parameter warmup on 1 temporal window")
     with torch.no_grad():
         _ = model_core(_history_to_device(init_batch["history"], device))
+    if runtime.is_main:
+        logger.info("STGNN init: lazy-parameter warmup complete")
 
     if runtime.enabled:
+        if runtime.is_main:
+            logger.info("STGNN init: wrapping model with DistributedDataParallel")
         model: nn.Module = DDP(
             model_core,
             device_ids=[runtime.local_rank] if device.type == "cuda" else None,
@@ -649,6 +655,8 @@ def fit_and_forecast_stgnn(
         )
     else:
         model = model_core
+    if runtime.is_main:
+        logger.info("STGNN init: model ready for training")
 
     loss_fn = _select_loss(getattr(config, "xlinear_loss", "huber")).to(device)
     optimizer = torch.optim.AdamW(
