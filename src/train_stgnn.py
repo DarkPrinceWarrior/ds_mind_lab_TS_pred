@@ -159,6 +159,30 @@ def _select_loss(name: str) -> nn.Module:
     return nn.HuberLoss()
 
 
+def _is_single_relation_multitask(config: Any) -> bool:
+    return str(getattr(config, "stgnn_variant", "legacy_multigraph")).strip().lower() == "single_relation_multitask"
+
+
+def _compute_target_scaler(samples: List[Dict[str, Any]], target_names: List[str]) -> Dict[str, Any]:
+    tensors = [sample["target"].float() for sample in samples if sample.get("target") is not None]
+    if not tensors:
+        return {"mean": torch.zeros(len(target_names), dtype=torch.float32), "std": torch.ones(len(target_names), dtype=torch.float32), "target_names": list(target_names)}
+    merged = torch.cat([tensor.reshape(-1, tensor.shape[-1]) for tensor in tensors], dim=0)
+    mean = merged.mean(dim=0)
+    std = merged.std(dim=0, unbiased=False).clamp_min(1e-6)
+    return {"mean": mean, "std": std, "target_names": list(target_names)}
+
+
+def _standardize_targets(values: torch.Tensor, scaler: Optional[Dict[str, Any]], device: torch.device) -> torch.Tensor:
+    if not scaler:
+        return values
+    mean = scaler["mean"].to(device=device, dtype=values.dtype)
+    std = scaler["std"].to(device=device, dtype=values.dtype)
+    shape = [1] * values.dim()
+    shape[-1] = mean.numel()
+    return (values - mean.view(*shape)) / std.view(*shape)
+
+
 def _find_window_splits(
     graph_bundle: Dict[str, Any],
     train_cutoff: pd.Timestamp,
@@ -402,26 +426,56 @@ def _compute_batch_loss(
     config: Any,
     device: torch.device,
     epoch: int,
+    target_scaler: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float], torch.Tensor]:
     history = _history_to_device(batch["history"], device)
     target = batch["target"].to(device, non_blocking=True)
     use_amp = bool(getattr(config, "stgnn_use_amp", False)) and device.type == "cuda"
+    single_relation_multitask = _is_single_relation_multitask(config)
+    target_names = list((target_scaler or {}).get("target_names", ["wlpr"])) if target_scaler else (["wlpr", "womr", "fw"] if single_relation_multitask else ["wlpr"])
 
     with _autocast_context(device, use_amp):
         pred, diagnostics = model(history)
 
     if pred.dim() == 2:
         pred = pred.unsqueeze(0)
+    if pred.dim() == 3 and target.dim() == 4 and target.shape[-1] == 1:
+        pred = pred.unsqueeze(-1)
+    elif pred.dim() == 3 and target.dim() == 3:
+        pred = pred.unsqueeze(0)
+        target = target.unsqueeze(0)
+    elif pred.dim() == 2 and target.dim() == 2:
+        pred = pred.unsqueeze(-1)
+        target = target.unsqueeze(-1)
     pred = pred.float()
     target = target.float()
-    data_loss = loss_fn(pred, target)
-    total_loss = data_loss
+
     log_parts = {
-        "data_loss": float(data_loss.detach().cpu()),
         "batch_size": float(pred.size(0)),
     }
+    if single_relation_multitask:
+        pred_scaled = _standardize_targets(pred, target_scaler, device)
+        target_scaled = _standardize_targets(target, target_scaler, device)
+        per_target_losses: List[torch.Tensor] = []
+        for idx, target_name in enumerate(target_names):
+            channel_loss = loss_fn(pred_scaled[..., idx], target_scaled[..., idx])
+            per_target_losses.append(channel_loss)
+            log_parts[f"data_loss_{target_name}"] = float(channel_loss.detach().cpu())
+        data_loss = torch.stack(per_target_losses).mean()
+    else:
+        if target.dim() == pred.dim() and target.shape[-1] == 1:
+            pred_eval = pred.squeeze(-1)
+            target_eval = target.squeeze(-1)
+        else:
+            pred_eval = pred
+            target_eval = target
+        data_loss = loss_fn(pred_eval, target_eval)
+        log_parts["data_loss_wlpr"] = float(data_loss.detach().cpu())
+    total_loss = data_loss
+    log_parts["data_loss"] = float(data_loss.detach().cpu())
 
-    if bool(config.physics_loss_enabled):
+    physics_enabled = bool(config.physics_loss_enabled) and not single_relation_multitask
+    if physics_enabled:
         schedule = 0.0
         warmup_epochs = max(int(config.physics_warmup_epochs), 1)
         if epoch >= warmup_epochs:
@@ -475,6 +529,9 @@ def _compute_batch_loss(
         else:
             log_parts["physics_weight"] = schedule
             log_parts["physics_loss"] = 0.0
+    elif single_relation_multitask:
+        log_parts["physics_weight"] = 0.0
+        log_parts["physics_loss"] = 0.0
     return total_loss, log_parts, pred.detach()
 
 
@@ -487,6 +544,7 @@ def _evaluate_loader(
     config: Any,
     device: torch.device,
     epoch: int,
+    target_scaler: Optional[Dict[str, Any]] = None,
 ) -> float:
     if loader is None:
         return float("inf")
@@ -494,7 +552,7 @@ def _evaluate_loader(
     model.eval()
     with torch.no_grad():
         for batch in loader:
-            loss, _, _ = _compute_batch_loss(model, batch, loss_fn, multigraph_spec, frames, config, device, epoch)
+            loss, _, _ = _compute_batch_loss(model, batch, loss_fn, multigraph_spec, frames, config, device, epoch, target_scaler=target_scaler)
             losses.append(float(loss.detach().cpu()))
     return float(np.mean(losses)) if losses else float("inf")
 
@@ -503,12 +561,23 @@ def _prediction_frame(
     pred: torch.Tensor,
     forecast_dates: List[pd.Timestamp],
     producer_ids: List[str],
+    target_names: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     pred_np = pred.detach().float().cpu().numpy()
+    target_names = list(target_names or ["wlpr"])
     records = []
+    multitask = pred_np.ndim == 3 and pred_np.shape[-1] > 1
     for prod_idx, well in enumerate(producer_ids):
         for step, ds in enumerate(forecast_dates):
-            records.append({"unique_id": well, "ds": pd.Timestamp(ds), "y_hat": float(pred_np[prod_idx, step])})
+            record = {"unique_id": well, "ds": pd.Timestamp(ds)}
+            if multitask:
+                record["y_hat"] = float(pred_np[prod_idx, step, 0])
+                for target_idx, target_name in enumerate(target_names[1:], start=1):
+                    record[f"y_hat_{target_name}"] = float(pred_np[prod_idx, step, target_idx])
+            else:
+                value = pred_np[prod_idx, step, 0] if pred_np.ndim == 3 else pred_np[prod_idx, step]
+                record["y_hat"] = float(value)
+            records.append(record)
     return pd.DataFrame.from_records(records)
 
 
@@ -601,6 +670,9 @@ def fit_and_forecast_stgnn(
         if runtime.enabled else None
     )
 
+    target_names = list(graph_bundle.get("metadata", {}).get("target_names", ["wlpr"]))
+    target_scaler = _compute_target_scaler(train_samples, target_names) if _is_single_relation_multitask(config) else None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -646,6 +718,7 @@ def fit_and_forecast_stgnn(
     if runtime.is_main:
         logger.info("STGNN init: lazy-parameter warmup complete")
 
+    find_unused_parameters = not _is_single_relation_multitask(config)
     if runtime.enabled:
         if runtime.is_main:
             logger.info("STGNN init: wrapping model with DistributedDataParallel")
@@ -654,7 +727,7 @@ def fit_and_forecast_stgnn(
             device_ids=[runtime.local_rank] if device.type == "cuda" else None,
             output_device=runtime.local_rank if device.type == "cuda" else None,
             broadcast_buffers=False,
-            find_unused_parameters=True,
+            find_unused_parameters=find_unused_parameters,
             gradient_as_bucket_view=True,
         )
     else:
@@ -683,8 +756,10 @@ def fit_and_forecast_stgnn(
     max_epochs = max(int(config.stgnn_max_epochs), 1)
 
     if runtime.is_main:
+        if _is_single_relation_multitask(config) and bool(getattr(config, "physics_loss_enabled", False)):
+            logger.info("Physics regularization is ignored for stgnn_variant=single_relation_multitask; running data-only multitask training.")
         logger.info(
-            "STGNN training start: train_windows=%d, val_windows=%d, horizon=%d, input_size=%d, batch_size=%d, max_epochs=%d, device=%s, world_size=%d, amp=%s",
+            "STGNN training start: train_windows=%d, val_windows=%d, horizon=%d, input_size=%d, batch_size=%d, max_epochs=%d, device=%s, world_size=%d, amp=%s, variant=%s",
             len(train_samples),
             len(val_samples),
             int(config.horizon),
@@ -694,6 +769,7 @@ def fit_and_forecast_stgnn(
             device,
             runtime.world_size,
             use_amp,
+            getattr(config, "stgnn_variant", "legacy_multigraph"),
         )
 
     for epoch in range(1, max_epochs + 1):
@@ -713,7 +789,7 @@ def fit_and_forecast_stgnn(
             train_iter = progress_bar
         for batch_idx, batch in enumerate(train_iter, start=1):
             optimizer.zero_grad(set_to_none=True)
-            loss, log_parts, _ = _compute_batch_loss(model, batch, loss_fn, multigraph_spec, frames, config, device, epoch)
+            loss, log_parts, _ = _compute_batch_loss(model, batch, loss_fn, multigraph_spec, frames, config, device, epoch, target_scaler=target_scaler)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
@@ -730,7 +806,7 @@ def fit_and_forecast_stgnn(
         mean_train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
         mean_train_loss = _all_reduce_mean(mean_train_loss, runtime, device)
         if runtime.is_main:
-            val_loss = _evaluate_loader(model, val_loader, loss_fn, multigraph_spec, frames, config, device, epoch)
+            val_loss = _evaluate_loader(model, val_loader, loss_fn, multigraph_spec, frames, config, device, epoch, target_scaler=target_scaler)
         else:
             val_loss = 0.0
         val_loss = _broadcast_float(val_loss, runtime, device)
@@ -769,10 +845,10 @@ def fit_and_forecast_stgnn(
         model.eval()
         with torch.no_grad():
             test_batch = next(iter(test_loader))
-            _, _, pred = _compute_batch_loss(model, test_batch, loss_fn, multigraph_spec, frames, config, device, epoch=0)
+            _, _, pred = _compute_batch_loss(model, test_batch, loss_fn, multigraph_spec, frames, config, device, epoch=0, target_scaler=target_scaler)
         pred = pred.squeeze(0)
         plain_model = _unwrap_model(model)
-        pred_df = _prediction_frame(pred, test_sample["forecast_dates"], graph_bundle["metadata"]["producer_ids"])
+        pred_df = _prediction_frame(pred, test_sample["forecast_dates"], graph_bundle["metadata"]["producer_ids"], target_names=target_names)
         fusion_df = _fusion_weights_frame(plain_model)
         edge_alloc_df = _edge_allocations_frame(plain_model, multigraph_spec)
         physics_df = pd.DataFrame.from_records(physics_logs)
@@ -787,6 +863,18 @@ def fit_and_forecast_stgnn(
             "ddp_enabled": runtime.enabled,
             "batch_size": batch_size,
             "amp_enabled": use_amp,
+            "stgnn_variant": getattr(config, "stgnn_variant", "legacy_multigraph"),
+            "target_names": target_names,
+            "target_scaling": (
+                {
+                    name: {
+                        "mean": float(target_scaler["mean"][idx].item()),
+                        "std": float(target_scaler["std"][idx].item()),
+                    }
+                    for idx, name in enumerate(target_names)
+                }
+                if target_scaler is not None else None
+            ),
         }
         logger.info(
             "STGNN training complete: epochs=%d, best_val=%.5f, forecast_rows=%d",

@@ -314,6 +314,11 @@ def _finalize_prod_dataframe(prod_df: pd.DataFrame, config: PipelineConfig) -> p
     df["time_idx"] = df.sort_values("ds").groupby("well").cumcount()
     df["unique_id"] = df["well"]
     df["y"] = df["wlpr"].astype(float)
+    df["y_wlpr"] = df["wlpr"].astype(float)
+    df["y_womr"] = df["womr"].astype(float) if "womr" in df.columns else 0.0
+    if "fw" not in df.columns:
+        df["fw"] = 0.0
+    df["y_fw"] = df["fw"].astype(float)
     df = df.drop(columns=["type"], errors="ignore")
     return df
 
@@ -335,21 +340,60 @@ def _add_pseudo_productivity_features(
     train_cutoff: pd.Timestamp,
 ) -> pd.DataFrame:
     df = prod_df.copy()
-    if "wthp" not in df.columns or "wlpr" not in df.columns:
+    if "wlpr" not in df.columns:
         return df
     well_col = "well" if "well" in df.columns else "unique_id"
     train_mask = df["ds"] <= train_cutoff
-    p_ref = df.loc[train_mask & (df["wthp"] > 0)].groupby(well_col)["wthp"].quantile(0.95)
-    df["_p_ref"] = df[well_col].map(p_ref)
-    dp = (df["_p_ref"] - df["wthp"]).clip(lower=1.0)
-    df["pseudo_productivity_index"] = df["wlpr"] / dp
+    wbhp_available = "wbhp" in df.columns
+    wthp_available = "wthp" in df.columns
+    if not wbhp_available and not wthp_available:
+        return df
+
+    pressure_proxy = pd.Series(np.nan, index=df.index, dtype=float)
+    pressure_proxy_source = pd.Series("missing", index=df.index, dtype=object)
+    if wbhp_available:
+        wbhp_mask = pd.to_numeric(df["wbhp"], errors="coerce") > 0
+        pressure_proxy.loc[wbhp_mask] = pd.to_numeric(df.loc[wbhp_mask, "wbhp"], errors="coerce")
+        pressure_proxy_source.loc[wbhp_mask] = "wbhp"
+    if wthp_available:
+        fallback_mask = pressure_proxy.isna() & (pd.to_numeric(df["wthp"], errors="coerce") > 0)
+        pressure_proxy.loc[fallback_mask] = pd.to_numeric(df.loc[fallback_mask, "wthp"], errors="coerce")
+        pressure_proxy_source.loc[fallback_mask] = "wthp"
+
+    ref_by_well = {}
+    source_by_well = {}
+    proxy_numeric = pd.to_numeric(pressure_proxy, errors="coerce")
+    for source_name in ["wbhp", "wthp"]:
+        source_mask = train_mask & (pressure_proxy_source == source_name) & proxy_numeric.gt(0)
+        if not bool(source_mask.any()):
+            continue
+        p_ref = df.loc[source_mask].groupby(well_col).apply(lambda frame: float(proxy_numeric.loc[frame.index].quantile(0.95)))
+        for well, value in p_ref.items():
+            if well not in ref_by_well:
+                ref_by_well[well] = float(value)
+                source_by_well[well] = source_name
+
+    df["pressure_proxy_source"] = df[well_col].map(source_by_well)
+    unresolved_mask = df["pressure_proxy_source"].isna()
+    df.loc[unresolved_mask, "pressure_proxy_source"] = pressure_proxy_source.loc[unresolved_mask]
+    df["pressure_proxy_source"] = df["pressure_proxy_source"].fillna("missing")
+    df["pressure_proxy"] = proxy_numeric.fillna(0.0)
+    df["_p_ref"] = df[well_col].map(ref_by_well)
+    raw_dp = (df["_p_ref"] - df["pressure_proxy"]).where(df["_p_ref"].notna())
+    dp = raw_dp.clip(lower=1.0)
+    df["pseudo_productivity_index"] = (df["wlpr"] / dp).replace([np.inf, -np.inf], np.nan)
     df["productivity_index"] = df["pseudo_productivity_index"]
     df["dp_drawdown"] = dp
     df = df.drop(columns=["_p_ref"])
     df["pseudo_productivity_index"] = df["pseudo_productivity_index"].fillna(0.0)
     df["productivity_index"] = df["productivity_index"].fillna(0.0)
     df["dp_drawdown"] = df["dp_drawdown"].fillna(0.0)
-    logger.info("Computed pseudo productivity index J(t) and drawdown dp for %d wells", df[well_col].nunique())
+    source_counts = df[[well_col, "pressure_proxy_source"]].drop_duplicates()["pressure_proxy_source"].value_counts().to_dict()
+    logger.info(
+        "Computed pseudo productivity index J(t) and drawdown dp for %d wells using pressure proxy sources: %s",
+        df[well_col].nunique(),
+        source_counts,
+    )
     return df
 
 

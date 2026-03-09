@@ -806,6 +806,7 @@ def build_multigraph_spec(
     injector_ids = sorted(inj_frame["well"].astype(str).unique())
     dates = sorted(pd.to_datetime(prod_frame["ds"]).unique())
     graph_types = [graph_type for graph_type in config.resolved_graph_types() if graph_type in {"topo", "bin", "cond", "dyn", "causal"}]
+    single_relation_multitask = bool(getattr(config, "is_single_relation_multitask", lambda: False)())
     pair_attrs = dict(getattr(pair_table, "attrs", {})) if pair_table is not None else {}
     pair_table = pair_table.copy() if pair_table is not None else pd.DataFrame()
     if pair_attrs:
@@ -884,52 +885,86 @@ def build_multigraph_spec(
             dyn["inj_id"] = dyn["inj_id"].astype(str)
             temporal_lookup = {pd.Timestamp(ds): frame.set_index(["inj_id", "prod_id"]) for ds, frame in dyn.groupby("ds")}
 
-        graph_specs = {
-            "bin": {
-                "features": ["edge_exists", "kernel_weight", "distance_m", "metric_distance_m"],
-                "builder": lambda row, dyn_row: [
-                    1.0,
-                    float(row.get("kernel_weight", row.get("weight", 0.0))),
-                    float(row.get("distance_m", 0.0)),
-                    float(row.get("metric_distance_m", row.get("distance_m", 0.0))),
-                ],
-            },
-            "cond": {
-                "features": ["kernel_weight", "crm_weight", "corr", "lag", "tau", "causal_score", "attn_alpha_train_mean"],
-                "builder": lambda row, dyn_row: [
-                    float(row.get("kernel_weight", row.get("weight", 0.0))),
-                    float(row.get("crm_weight", row.get("kernel_weight", row.get("weight", 0.0)))),
-                    float(row.get("corr", 0.0)),
-                    float(row.get("lag", 0.0)),
-                    float(row.get("tau", 0.0)),
-                    float(row.get("causal_score", 0.0)),
-                    float(row.get("attn_alpha_train_mean", row.get("crm_weight", 0.0))),
-                ],
-            },
-            "dyn": {
-                "features": ["alpha_t", "lagged_rate_t", "crm_rate_t", "lagged_wwit_diff_t", "contribution_t", "stage_id", "regime_id"],
-                "builder": lambda row, dyn_row: [
-                    float((dyn_row or {}).get("alpha_t", row.get("attn_alpha_train_mean", row.get("kernel_weight", 0.0)))),
-                    float((dyn_row or {}).get("lagged_rate_t", 0.0)),
-                    float((dyn_row or {}).get("crm_rate_t", 0.0)),
-                    float((dyn_row or {}).get("lagged_wwit_diff_t", 0.0)),
-                    float((dyn_row or {}).get("contribution_t", 0.0)),
-                    float((dyn_row or {}).get("stage_id", 0.0) or 0.0),
-                    float((dyn_row or {}).get("regime_id", 0.0) or 0.0),
-                ],
-            },
-            "causal": {
-                "features": ["causal_score", "attn_alpha_train_mean", "attn_alpha_train_last", "attn_alpha_full_last", "lag", "tau"],
-                "builder": lambda row, dyn_row: [
-                    float(row.get("causal_score", 0.0)),
-                    float(row.get("attn_alpha_train_mean", row.get("crm_weight", 0.0))),
-                    float(row.get("attn_alpha_train_last", row.get("crm_weight", 0.0))),
-                    float(row.get("attn_alpha_full_last", row.get("crm_weight", 0.0))),
-                    float(row.get("lag", 0.0)),
-                    float(row.get("tau", 0.0)),
-                ],
-            },
-        }
+        if single_relation_multitask:
+            graph_specs = {
+                "bin": {
+                    "features": [
+                        "edge_exists", "kernel_weight", "distance_m", "metric_distance_m",
+                        "crm_weight", "corr", "lag", "tau", "causal_score",
+                        "attn_alpha_train_mean", "attn_alpha_train_last", "attn_alpha_full_last",
+                        "alpha_t", "lagged_rate_t", "crm_rate_t", "lagged_wwit_diff_t",
+                        "contribution_t", "stage_id", "regime_id",
+                    ],
+                    "builder": lambda row, dyn_row: [
+                        1.0,
+                        float(row.get("kernel_weight", row.get("weight", 0.0))),
+                        float(row.get("distance_m", 0.0)),
+                        float(row.get("metric_distance_m", row.get("distance_m", 0.0))),
+                        float(row.get("crm_weight", row.get("kernel_weight", row.get("weight", 0.0)))),
+                        float(row.get("corr", 0.0)),
+                        float(row.get("lag", 0.0)),
+                        float(row.get("tau", 0.0)),
+                        float(row.get("causal_score", 0.0)),
+                        float(row.get("attn_alpha_train_mean", row.get("crm_weight", 0.0))),
+                        float(row.get("attn_alpha_train_last", row.get("crm_weight", 0.0))),
+                        float(row.get("attn_alpha_full_last", row.get("crm_weight", 0.0))),
+                        float((dyn_row or {}).get("alpha_t", row.get("attn_alpha_train_mean", row.get("kernel_weight", 0.0)))),
+                        float((dyn_row or {}).get("lagged_rate_t", 0.0)),
+                        float((dyn_row or {}).get("crm_rate_t", 0.0)),
+                        float((dyn_row or {}).get("lagged_wwit_diff_t", 0.0)),
+                        float((dyn_row or {}).get("contribution_t", 0.0)),
+                        float((dyn_row or {}).get("stage_id", 0.0) or 0.0),
+                        float((dyn_row or {}).get("regime_id", 0.0) or 0.0),
+                    ],
+                },
+            }
+        else:
+            graph_specs = {
+                "bin": {
+                    "features": ["edge_exists", "kernel_weight", "distance_m", "metric_distance_m"],
+                    "builder": lambda row, dyn_row: [
+                        1.0,
+                        float(row.get("kernel_weight", row.get("weight", 0.0))),
+                        float(row.get("distance_m", 0.0)),
+                        float(row.get("metric_distance_m", row.get("distance_m", 0.0))),
+                    ],
+                },
+                "cond": {
+                    "features": ["kernel_weight", "crm_weight", "corr", "lag", "tau", "causal_score", "attn_alpha_train_mean"],
+                    "builder": lambda row, dyn_row: [
+                        float(row.get("kernel_weight", row.get("weight", 0.0))),
+                        float(row.get("crm_weight", row.get("kernel_weight", row.get("weight", 0.0)))),
+                        float(row.get("corr", 0.0)),
+                        float(row.get("lag", 0.0)),
+                        float(row.get("tau", 0.0)),
+                        float(row.get("causal_score", 0.0)),
+                        float(row.get("attn_alpha_train_mean", row.get("crm_weight", 0.0))),
+                    ],
+                },
+                "dyn": {
+                    "features": ["alpha_t", "lagged_rate_t", "crm_rate_t", "lagged_wwit_diff_t", "contribution_t", "stage_id", "regime_id"],
+                    "builder": lambda row, dyn_row: [
+                        float((dyn_row or {}).get("alpha_t", row.get("attn_alpha_train_mean", row.get("kernel_weight", 0.0)))),
+                        float((dyn_row or {}).get("lagged_rate_t", 0.0)),
+                        float((dyn_row or {}).get("crm_rate_t", 0.0)),
+                        float((dyn_row or {}).get("lagged_wwit_diff_t", 0.0)),
+                        float((dyn_row or {}).get("contribution_t", 0.0)),
+                        float((dyn_row or {}).get("stage_id", 0.0) or 0.0),
+                        float((dyn_row or {}).get("regime_id", 0.0) or 0.0),
+                    ],
+                },
+                "causal": {
+                    "features": ["causal_score", "attn_alpha_train_mean", "attn_alpha_train_last", "attn_alpha_full_last", "lag", "tau"],
+                    "builder": lambda row, dyn_row: [
+                        float(row.get("causal_score", 0.0)),
+                        float(row.get("attn_alpha_train_mean", row.get("crm_weight", 0.0))),
+                        float(row.get("attn_alpha_train_last", row.get("crm_weight", 0.0))),
+                        float(row.get("attn_alpha_full_last", row.get("crm_weight", 0.0))),
+                        float(row.get("lag", 0.0)),
+                        float(row.get("tau", 0.0)),
+                    ],
+                },
+            }
 
         for graph_type in graph_types:
             if graph_type == "topo" or graph_type not in graph_specs:
@@ -987,6 +1022,8 @@ def build_multigraph_spec(
         "edge_feature_names": edge_feature_names,
         "relation_groups": relation_groups,
         "graph_types": actual_graph_types,
+        "stgnn_variant": getattr(config, "stgnn_variant", "legacy_multigraph"),
+        "target_names": ["wlpr", "womr", "fw"] if single_relation_multitask else ["wlpr"],
     }
 
     return {
@@ -1004,7 +1041,12 @@ def build_multigraph_spec(
             for ds in dates
         },
         "producer_targets_by_time": {
-            pd.Timestamp(ds): producer_dynamic[pd.Timestamp(ds)][:, [producer_feature_cols.index("wlpr")]] if "wlpr" in producer_feature_cols else np.zeros((len(producer_ids), 1), dtype=float)
+            pd.Timestamp(ds): (
+                producer_dynamic[pd.Timestamp(ds)][:, [producer_feature_cols.index("wlpr"), producer_feature_cols.index("womr"), producer_feature_cols.index("fw")]]
+                if single_relation_multitask and all(name in producer_feature_cols for name in ["wlpr", "womr", "fw"]) else (
+                    producer_dynamic[pd.Timestamp(ds)][:, [producer_feature_cols.index("wlpr")]] if "wlpr" in producer_feature_cols else np.zeros((len(producer_ids), 1), dtype=float)
+                )
+            )
             for ds in dates
         },
         "edge_index_dict_by_graph": edge_index_dict_by_graph,

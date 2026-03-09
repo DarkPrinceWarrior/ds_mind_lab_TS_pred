@@ -217,12 +217,12 @@ class MultiGraphHeteroEncoder(nn.Module):
 
 
 class ProducerForecastHead(nn.Module):
-    def __init__(self, hidden_dim: int, horizon: int):
+    def __init__(self, hidden_dim: int, output_dim: int):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, horizon),
+            nn.Linear(hidden_dim, output_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -236,6 +236,9 @@ class STGNNPyG(nn.Module):
         self.config = config
         self.graph_types = list(metadata.get("graph_types", []))
         self.node_types = ["producer", "injector"]
+        self.variant = str(getattr(config, "stgnn_variant", metadata.get("stgnn_variant", "legacy_multigraph"))).strip().lower()
+        self.target_names = list(metadata.get("target_names", ["wlpr"]))
+        self.target_dim = max(len(self.target_names), 1)
         hidden_dim = int(config.stgnn_hidden_dim)
         temporal_hidden_dim = int(config.stgnn_temporal_hidden_dim)
         self.encoder = MultiGraphHeteroEncoder(metadata, config)
@@ -247,8 +250,8 @@ class STGNNPyG(nn.Module):
                 for graph_type in self.graph_types
             }
         )
-        self.fusion = GraphFusionAttention(hidden_dim, self.graph_types)
-        self.head = ProducerForecastHead(hidden_dim, int(config.horizon))
+        self.fusion = None if (self.variant == "single_relation_multitask" or len(self.graph_types) == 1) else GraphFusionAttention(hidden_dim, self.graph_types)
+        self.head = ProducerForecastHead(hidden_dim, int(config.horizon) * self.target_dim)
         self.forward_edge_types: Dict[str, tuple[str, str, str]] = {}
         self.edge_heads = nn.ModuleDict()
         for graph_type in self.graph_types:
@@ -336,9 +339,16 @@ class STGNNPyG(nn.Module):
                 seq = torch.stack(branch_sequences[graph_type][node_type], dim=1)
                 branch_embeddings[graph_type][node_type] = self.temporal[graph_type][node_type](seq)
 
-        fused, fusion_weights = self.fusion(branch_embeddings)
+        if self.fusion is None:
+            graph_type = self.graph_types[0]
+            fused = branch_embeddings[graph_type]
+            fusion_weights = torch.ones((1,), device=fused["producer"].device, dtype=fused["producer"].dtype)
+        else:
+            fused, fusion_weights = self.fusion(branch_embeddings)
         self.latest_fusion_weights = fusion_weights.detach()
         pred = self.head(fused["producer"])
+        if self.target_dim > 1:
+            pred = pred.view(pred.size(0), int(self.config.horizon), self.target_dim)
         producer_batch = getattr(history[-1]["producer"], "batch", None)
         pred = _split_by_batch(pred, producer_batch)
 

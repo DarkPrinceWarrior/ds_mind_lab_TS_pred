@@ -140,6 +140,7 @@ class PipelineConfig:
 
     # Model selection
     model_type: str = "chronos2"  # "chronos2", "xlinear", "stgnn_pyg"
+    stgnn_variant: str = "single_relation_multitask"  # "single_relation_multitask", "legacy_multigraph"
 
     # XLinear configuration (NeuralForecast)
     xlinear_hidden_size: int = 128
@@ -189,7 +190,7 @@ class PipelineConfig:
     stgnn_use_amp: bool = False
     stgnn_prod_feature_cols: List[str] = field(
         default_factory=lambda: [
-            "wlpr", "womr", "wlpt", "wthp", "fw",
+            "wlpr", "womr", "wlpt", "wbhp", "wthp", "fw",
             "pseudo_productivity_index", "dp_drawdown",
             "wlpr_diff1", "wlpr_cumsum1", "womr_diff1", "womr_cumsum1",
             "dtw_neighbor_avg_wlpr",
@@ -222,7 +223,12 @@ class PipelineConfig:
     def is_graph_model(self) -> bool:
         return str(self.model_type).strip().lower() == "stgnn_pyg"
 
+    def is_single_relation_multitask(self) -> bool:
+        return str(self.stgnn_variant).strip().lower() == "single_relation_multitask"
+
     def resolved_graph_types(self) -> List[str]:
+        if self.is_single_relation_multitask():
+            return ["bin"]
         values = [str(item).strip().lower() for item in self.graph_types if str(item).strip()]
         return values or ["topo", "bin", "cond", "dyn", "causal"]
 

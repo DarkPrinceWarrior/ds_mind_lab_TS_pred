@@ -76,6 +76,8 @@ def to_heterodata_snapshots(
         "edge_feature_names": dict(multigraph_spec.get("graph_metadata", {}).get("edge_feature_names", {})),
         "relation_groups": dict(multigraph_spec.get("graph_metadata", {}).get("relation_groups", {})),
         "graph_types": list(multigraph_spec.get("graph_types", [])),
+        "target_names": list(multigraph_spec.get("graph_metadata", {}).get("target_names", ["wlpr"])),
+        "stgnn_variant": multigraph_spec.get("graph_metadata", {}).get("stgnn_variant", "legacy_multigraph"),
     }
     return {
         "dates": dates,
@@ -97,13 +99,17 @@ def build_temporal_graph_windows(
     if not snapshots or len(snapshots) < input_size + horizon:
         return windows
 
+    target_dim = max(int(len(graph_bundle.get("metadata", {}).get("target_names", ["wlpr"]))), 1)
     for end_idx in range(input_size - 1, len(snapshots) - horizon):
         history = snapshots[end_idx - input_size + 1: end_idx + 1]
         future_dates = dates[end_idx + 1: end_idx + 1 + horizon]
         target_steps: List[np.ndarray] = []
         for future_idx in range(end_idx + 1, end_idx + 1 + horizon):
             target_steps.append(snapshots[future_idx]["producer"].y.cpu().numpy())
-        target = np.concatenate(target_steps, axis=1) if target_steps else np.zeros((len(producer_ids), horizon), dtype=float)
+        if target_steps:
+            target = np.stack(target_steps, axis=1)
+        else:
+            target = np.zeros((len(producer_ids), horizon, target_dim), dtype=float)
         windows.append(
             {
                 "history": history,

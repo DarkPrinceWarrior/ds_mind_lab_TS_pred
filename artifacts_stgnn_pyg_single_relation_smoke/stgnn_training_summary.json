@@ -1,0 +1,31 @@
+{
+  "train_windows": 139,
+  "val_windows": 1,
+  "best_val_loss": 0.870560348033905,
+  "epochs_trained": 1,
+  "device": "cuda",
+  "world_size": 1,
+  "ddp_enabled": false,
+  "batch_size": 2,
+  "amp_enabled": false,
+  "stgnn_variant": "single_relation_multitask",
+  "target_names": [
+    "wlpr",
+    "womr",
+    "fw"
+  ],
+  "target_scaling": {
+    "wlpr": {
+      "mean": 165.3250732421875,
+      "std": 140.76416015625
+    },
+    "womr": {
+      "mean": 8.643619537353516,
+      "std": 8.084601402282715
+    },
+    "fw": {
+      "mean": 0.8873993158340454,
+      "std": 0.11694920808076859
+    }
+  }
+}

@@ -388,6 +388,13 @@ def parse_args() -> argparse.Namespace:
         help="Enable automatic mixed precision (bf16 autocast on CUDA) for STGNN PyG training",
     )
     parser.add_argument(
+        "--stgnn-variant",
+        type=str,
+        default=None,
+        choices=["single_relation_multitask", "legacy_multigraph"],
+        help="STGNN PyG architecture variant",
+    )
+    parser.add_argument(
         "--physics-warmup-epochs",
         type=int,
         default=None,
@@ -511,6 +518,8 @@ def main() -> None:
         config.stgnn_num_workers = int(args.stgnn_num_workers)
     if args.stgnn_use_amp:
         config.stgnn_use_amp = True
+    if args.stgnn_variant:
+        config.stgnn_variant = str(args.stgnn_variant)
     if args.physics_warmup_epochs is not None:
         config.physics_warmup_epochs = int(args.physics_warmup_epochs)
     if args.physics_weight_max is not None:
