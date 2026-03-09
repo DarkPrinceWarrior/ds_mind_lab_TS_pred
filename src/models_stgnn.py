@@ -34,7 +34,8 @@ def _segment_softmax(scores: torch.Tensor, index: torch.Tensor, num_segments: in
     for segment in range(max(int(num_segments), 0)):
         mask = index == segment
         if torch.any(mask):
-            weights[mask] = torch.softmax(scores[mask], dim=0)
+            segment_weights = torch.softmax(scores[mask].float(), dim=0).to(dtype=scores.dtype)
+            weights[mask] = segment_weights
     return weights
 
 
