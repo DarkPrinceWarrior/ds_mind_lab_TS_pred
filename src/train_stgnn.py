@@ -718,7 +718,10 @@ def fit_and_forecast_stgnn(
     if runtime.is_main:
         logger.info("STGNN init: lazy-parameter warmup complete")
 
-    find_unused_parameters = not _is_single_relation_multitask(config)
+    # The single-relation multitask path keeps diagnostics-only modules
+    # (edge allocation heads, injector temporal branch) that do not
+    # participate in the data-only loss on every step.
+    find_unused_parameters = bool(_is_single_relation_multitask(config))
     if runtime.enabled:
         if runtime.is_main:
             logger.info("STGNN init: wrapping model with DistributedDataParallel")
