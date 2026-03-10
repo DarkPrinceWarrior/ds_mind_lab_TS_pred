@@ -183,6 +183,16 @@ def _standardize_targets(values: torch.Tensor, scaler: Optional[Dict[str, Any]],
     return (values - mean.view(*shape)) / std.view(*shape)
 
 
+def _inverse_standardize_targets(values: torch.Tensor, scaler: Optional[Dict[str, Any]], device: torch.device) -> torch.Tensor:
+    if not scaler:
+        return values
+    mean = scaler["mean"].to(device=device, dtype=values.dtype)
+    std = scaler["std"].to(device=device, dtype=values.dtype)
+    shape = [1] * values.dim()
+    shape[-1] = mean.numel()
+    return values * std.view(*shape) + mean.view(*shape)
+
+
 def _find_window_splits(
     graph_bundle: Dict[str, Any],
     train_cutoff: pd.Timestamp,
@@ -562,8 +572,12 @@ def _prediction_frame(
     forecast_dates: List[pd.Timestamp],
     producer_ids: List[str],
     target_names: Optional[List[str]] = None,
+    pred_scaled: Optional[torch.Tensor] = None,
+    pred_inverse: Optional[torch.Tensor] = None,
 ) -> pd.DataFrame:
     pred_np = pred.detach().float().cpu().numpy()
+    pred_scaled_np = pred_scaled.detach().float().cpu().numpy() if pred_scaled is not None else None
+    pred_inverse_np = pred_inverse.detach().float().cpu().numpy() if pred_inverse is not None else None
     target_names = list(target_names or ["wlpr"])
     records = []
     multitask = pred_np.ndim == 3 and pred_np.shape[-1] > 1
@@ -572,13 +586,44 @@ def _prediction_frame(
             record = {"unique_id": well, "ds": pd.Timestamp(ds)}
             if multitask:
                 record["y_hat"] = float(pred_np[prod_idx, step, 0])
+                if pred_scaled_np is not None:
+                    record["y_hat_std"] = float(pred_scaled_np[prod_idx, step, 0])
+                if pred_inverse_np is not None:
+                    record["y_hat_inverse"] = float(pred_inverse_np[prod_idx, step, 0])
                 for target_idx, target_name in enumerate(target_names[1:], start=1):
                     record[f"y_hat_{target_name}"] = float(pred_np[prod_idx, step, target_idx])
+                    if pred_scaled_np is not None:
+                        record[f"y_hat_{target_name}_std"] = float(pred_scaled_np[prod_idx, step, target_idx])
+                    if pred_inverse_np is not None:
+                        record[f"y_hat_{target_name}_inverse"] = float(pred_inverse_np[prod_idx, step, target_idx])
             else:
                 value = pred_np[prod_idx, step, 0] if pred_np.ndim == 3 else pred_np[prod_idx, step]
                 record["y_hat"] = float(value)
+                if pred_scaled_np is not None:
+                    scaled_value = pred_scaled_np[prod_idx, step, 0] if pred_scaled_np.ndim == 3 else pred_scaled_np[prod_idx, step]
+                    record["y_hat_std"] = float(scaled_value)
+                if pred_inverse_np is not None:
+                    inverse_value = pred_inverse_np[prod_idx, step, 0] if pred_inverse_np.ndim == 3 else pred_inverse_np[prod_idx, step]
+                    record["y_hat_inverse"] = float(inverse_value)
             records.append(record)
     return pd.DataFrame.from_records(records)
+
+
+def _tensor_channel_ranges(values: Optional[torch.Tensor], target_names: List[str]) -> Optional[Dict[str, Dict[str, float]]]:
+    if values is None:
+        return None
+    arr = values.detach().float().cpu()
+    if arr.dim() == 2:
+        arr = arr.unsqueeze(-1)
+    result: Dict[str, Dict[str, float]] = {}
+    for idx, target_name in enumerate(target_names):
+        channel = arr[..., idx]
+        result[target_name] = {
+            "min": float(channel.min().item()),
+            "max": float(channel.max().item()),
+            "mean": float(channel.mean().item()),
+        }
+    return result
 
 
 def _fusion_weights_frame(model: STGNNPyG) -> pd.DataFrame:
@@ -850,8 +895,17 @@ def fit_and_forecast_stgnn(
             test_batch = next(iter(test_loader))
             _, _, pred = _compute_batch_loss(model, test_batch, loss_fn, multigraph_spec, frames, config, device, epoch=0, target_scaler=target_scaler)
         pred = pred.squeeze(0)
+        pred_scaled = _standardize_targets(pred, target_scaler, device) if target_scaler is not None else None
+        pred_inverse = _inverse_standardize_targets(pred_scaled, target_scaler, device) if pred_scaled is not None else None
         plain_model = _unwrap_model(model)
-        pred_df = _prediction_frame(pred, test_sample["forecast_dates"], graph_bundle["metadata"]["producer_ids"], target_names=target_names)
+        pred_df = _prediction_frame(
+            pred,
+            test_sample["forecast_dates"],
+            graph_bundle["metadata"]["producer_ids"],
+            target_names=target_names,
+            pred_scaled=pred_scaled,
+            pred_inverse=pred_inverse,
+        )
         fusion_df = _fusion_weights_frame(plain_model)
         edge_alloc_df = _edge_allocations_frame(plain_model, multigraph_spec)
         physics_df = pd.DataFrame.from_records(physics_logs)
@@ -879,6 +933,24 @@ def fit_and_forecast_stgnn(
                 if target_scaler is not None else None
             ),
         }
+        if target_scaler is not None:
+            inverse_err = float((pred_inverse - pred).abs().max().item()) if pred_inverse is not None else 0.0
+            training_summary["prediction_scale_contract"] = {
+                "model_output_units": "raw",
+                "loss_space": "standardized_targets",
+                "export_units": "raw",
+                "evaluation_units": "raw",
+            }
+            training_summary["prediction_scale_audit"] = {
+                "max_inverse_reconstruction_abs_error": inverse_err,
+                "raw_prediction_ranges": _tensor_channel_ranges(pred, target_names),
+                "standardized_prediction_ranges": _tensor_channel_ranges(pred_scaled, target_names),
+                "inverse_prediction_ranges": _tensor_channel_ranges(pred_inverse, target_names),
+            }
+            logger.info(
+                "STGNN scale audit: model outputs raw units, loss uses standardized targets, max_inverse_reconstruction_abs_error=%.6g",
+                inverse_err,
+            )
         logger.info(
             "STGNN training complete: epochs=%d, best_val=%.5f, forecast_rows=%d",
             training_summary["epochs_trained"],

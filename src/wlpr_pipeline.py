@@ -1219,8 +1219,9 @@ def _select_interval_columns(
 
 
 def merge_forecast_frame(pred_df: pd.DataFrame, test_df: pd.DataFrame) -> pd.DataFrame:
-    pred_cols = ["unique_id", "ds", "y_hat"] + [
-        c for c in pred_df.columns if c.startswith("q_") or c.startswith("cp_")
+    pred_cols = ["unique_id", "ds"] + [
+        c for c in pred_df.columns
+        if c.startswith("y_hat") or c.startswith("q_") or c.startswith("cp_")
     ]
     pred_cols = list(dict.fromkeys(pred_cols))
     preserved_test_cols = ["unique_id", "ds"] + [
