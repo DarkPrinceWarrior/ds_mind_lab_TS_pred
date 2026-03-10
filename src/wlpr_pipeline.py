@@ -367,7 +367,9 @@ def _add_pseudo_productivity_features(
         source_mask = train_mask & (pressure_proxy_source == source_name) & proxy_numeric.gt(0)
         if not bool(source_mask.any()):
             continue
-        p_ref = df.loc[source_mask].groupby(well_col).apply(lambda frame: float(proxy_numeric.loc[frame.index].quantile(0.95)))
+        source_frame = df.loc[source_mask, [well_col]].copy()
+        source_frame["pressure_proxy"] = proxy_numeric.loc[source_mask].to_numpy()
+        p_ref = source_frame.groupby(well_col)["pressure_proxy"].quantile(0.95)
         for well, value in p_ref.items():
             if well not in ref_by_well:
                 ref_by_well[well] = float(value)

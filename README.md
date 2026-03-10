@@ -16,8 +16,8 @@
 - Строит лаговые признаки закачки с подбором лага и калибровкой ядра весов
 - Строит attention-связность `injector→producer` методом `causal_stage_geo` и признаки `inj_*_attn`
 - Добавляет пространственные, временные и графовые признаки
-- Для `stgnn_pyg` собирает multi-graph `HeteroData` snapshots (`topo/bin/cond/dyn/causal`)
-- Для `stgnn_pyg` обучает relation-specific `HeteroConv` + temporal encoder + graph fusion + physics regularization
+- Для `stgnn_pyg` по умолчанию собирает single-relation `HeteroData` snapshots (`injector->producer` + reverse edge) и multitask target `{WLPR, WOMR, FW}`
+- Для `stgnn_pyg` по умолчанию обучает data-only single-relation STGNN; `legacy_multigraph` сохранен как ablation/comparison path
 - Делает split train/test по горизонту прогноза
 - Считает walk-forward кросс-валидацию
 - Калибрует prediction intervals через grouped Conformal (ICP/WCP) на out-of-sample residuals из CV
@@ -88,6 +88,10 @@ python3 -m src.artifacts \
   --output-dir artifacts_stgnn_pyg
 ```
 
+Примечание:
+- Для `stgnn_pyg` default variant теперь `single_relation_multitask`.
+- Чтобы запустить старую multi-graph ветку для сравнения, добавь `--stgnn-variant legacy_multigraph`.
+
 Быстрый smoke-run для `stgnn_pyg`:
 
 ```bash
@@ -98,6 +102,7 @@ python3 -m src.artifacts \
   --output-dir artifacts_stgnn_pyg_smoke \
   --disable-cv \
   --disable-conformal \
+  --stgnn-variant single_relation_multitask \
   --stgnn-max-epochs 10 \
   --stgnn-early-stop-patience 3
 ```
@@ -112,6 +117,7 @@ torchrun --standalone --nproc_per_node=6 -m src.artifacts \
   --output-dir artifacts_stgnn_pyg_ddp \
   --disable-cv \
   --disable-conformal \
+  --stgnn-variant single_relation_multitask \
   --stgnn-max-epochs 40 \
   --stgnn-early-stop-patience 8 \
   --stgnn-batch-size 16 \
@@ -218,6 +224,7 @@ python3 scripts/scenario_shutoff_34.py --model stgnn_pyg
 - `--inj-attention-future-anchor-strength` якорение future `alpha(t)` к train-last
 - `--inj-attention-geo-condition-strength` сила geo-conditioned blending в prior для attention
 - `--disable-inj-attention-stage-adaptive` отключить stage-adaptive gating (фиксированный mix в `causal_stage_geo`)
+- `--stgnn-variant` вариант STGNN PyG: `single_relation_multitask` (default) или `legacy_multigraph`
 - `--stgnn-max-epochs` переопределить максимум эпох для `stgnn_pyg`
 - `--stgnn-early-stop-patience` переопределить early stopping patience для `stgnn_pyg`
 
