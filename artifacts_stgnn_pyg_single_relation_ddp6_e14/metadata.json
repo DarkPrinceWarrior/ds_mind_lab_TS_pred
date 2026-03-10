@@ -257,12 +257,12 @@
     "stgnn_edge_dropout": 0.0,
     "stgnn_feature_dropout": 0.1,
     "stgnn_batch_size": 2,
-    "stgnn_max_epochs": 1,
+    "stgnn_max_epochs": 14,
     "stgnn_learning_rate": 0.001,
     "stgnn_weight_decay": 0.0001,
     "stgnn_scheduler_patience": 8,
-    "stgnn_early_stop_patience": 1,
-    "stgnn_num_workers": 0,
+    "stgnn_early_stop_patience": 5,
+    "stgnn_num_workers": 4,
     "stgnn_use_amp": false,
     "stgnn_prod_feature_cols": [
       "wlpr",
@@ -330,21 +330,21 @@
     "kernel_params": {
       "p": 4.0
     },
-    "kernel_score": 10.449543656138275
+    "kernel_score": 10.449543656138271
   },
-  "injection_summary_path": "artifacts_stgnn_pyg_single_relation_smoke/injection_lag_summary.csv",
+  "injection_summary_path": "artifacts_stgnn_pyg_single_relation_ddp6_e14/injection_lag_summary.csv",
   "injection_pairs": 65,
-  "attention_alpha_timeseries_path": "artifacts_stgnn_pyg_single_relation_smoke/alpha_timeseries.parquet",
+  "attention_alpha_timeseries_path": "artifacts_stgnn_pyg_single_relation_ddp6_e14/alpha_timeseries.parquet",
   "attention_alpha_timeseries_rows": 12155,
   "pdf_reports": {
-    "test_forecast": "artifacts_stgnn_pyg_single_relation_smoke/wlpr_forecasts.pdf",
-    "full_history": "artifacts_stgnn_pyg_single_relation_smoke/wlpr_full_history.pdf",
-    "residuals": "artifacts_stgnn_pyg_single_relation_smoke/wlpr_residuals.pdf",
-    "feature_analysis": "artifacts_stgnn_pyg_single_relation_smoke/feature_analysis.pdf"
+    "test_forecast": "artifacts_stgnn_pyg_single_relation_ddp6_e14/wlpr_forecasts.pdf",
+    "full_history": "artifacts_stgnn_pyg_single_relation_ddp6_e14/wlpr_full_history.pdf",
+    "residuals": "artifacts_stgnn_pyg_single_relation_ddp6_e14/wlpr_residuals.pdf",
+    "feature_analysis": "artifacts_stgnn_pyg_single_relation_ddp6_e14/feature_analysis.pdf"
   },
-  "graph_fusion_weights_path": "artifacts_stgnn_pyg_single_relation_smoke/graph_fusion_weights.parquet",
-  "edge_allocations_path": "artifacts_stgnn_pyg_single_relation_smoke/edge_allocations.parquet",
-  "well_event_metrics_path": "artifacts_stgnn_pyg_single_relation_smoke/well_event_metrics.csv",
-  "physics_history_path": "artifacts_stgnn_pyg_single_relation_smoke/physics_history.csv",
-  "stgnn_training_summary_path": "artifacts_stgnn_pyg_single_relation_smoke/stgnn_training_summary.json"
+  "graph_fusion_weights_path": "artifacts_stgnn_pyg_single_relation_ddp6_e14/graph_fusion_weights.parquet",
+  "edge_allocations_path": "artifacts_stgnn_pyg_single_relation_ddp6_e14/edge_allocations.parquet",
+  "well_event_metrics_path": "artifacts_stgnn_pyg_single_relation_ddp6_e14/well_event_metrics.csv",
+  "physics_history_path": "artifacts_stgnn_pyg_single_relation_ddp6_e14/physics_history.csv",
+  "stgnn_training_summary_path": "artifacts_stgnn_pyg_single_relation_ddp6_e14/stgnn_training_summary.json"
 }
