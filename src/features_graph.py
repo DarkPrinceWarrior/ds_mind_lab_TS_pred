@@ -806,7 +806,7 @@ def build_multigraph_spec(
     injector_ids = sorted(inj_frame["well"].astype(str).unique())
     dates = sorted(pd.to_datetime(prod_frame["ds"]).unique())
     graph_types = [graph_type for graph_type in config.resolved_graph_types() if graph_type in {"topo", "bin", "cond", "dyn", "causal"}]
-    single_relation_multitask = bool(getattr(config, "is_single_relation_multitask", lambda: False)())
+    single_relation_multitask = bool(getattr(config, "is_multitask_stgnn_variant", lambda: False)())
     pair_attrs = dict(getattr(pair_table, "attrs", {})) if pair_table is not None else {}
     pair_table = pair_table.copy() if pair_table is not None else pd.DataFrame()
     if pair_attrs:

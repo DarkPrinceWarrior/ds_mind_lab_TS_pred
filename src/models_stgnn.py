@@ -241,26 +241,38 @@ class STGNNPyG(nn.Module):
         self.target_dim = max(len(self.target_names), 1)
         hidden_dim = int(config.stgnn_hidden_dim)
         temporal_hidden_dim = int(config.stgnn_temporal_hidden_dim)
-        self.encoder = MultiGraphHeteroEncoder(metadata, config)
-        self.temporal = nn.ModuleDict(
-            {
-                graph_type: nn.ModuleDict(
-                    {node_type: TemporalBackbone(config.stgnn_temporal_backbone, hidden_dim, temporal_hidden_dim) for node_type in self.node_types}
-                )
-                for graph_type in self.graph_types
-            }
-        )
-        self.fusion = None if (self.variant == "single_relation_multitask" or len(self.graph_types) == 1) else GraphFusionAttention(hidden_dim, self.graph_types)
+        self.use_graph_message_passing = bool(getattr(config, "uses_graph_message_passing", lambda: True)())
+        self.use_edge_allocation_head = bool(getattr(config, "uses_edge_allocation_head", lambda: True)())
+        if self.use_graph_message_passing:
+            self.encoder = MultiGraphHeteroEncoder(metadata, config)
+            self.temporal = nn.ModuleDict(
+                {
+                    graph_type: nn.ModuleDict(
+                        {node_type: TemporalBackbone(config.stgnn_temporal_backbone, hidden_dim, temporal_hidden_dim) for node_type in self.node_types}
+                    )
+                    for graph_type in self.graph_types
+                }
+            )
+            self.producer_input_proj = None
+            self.producer_temporal = None
+        else:
+            self.encoder = None
+            self.temporal = None
+            self.producer_input_proj = nn.LazyLinear(hidden_dim)
+            self.producer_temporal = TemporalBackbone(config.stgnn_temporal_backbone, hidden_dim, temporal_hidden_dim)
+        self.fusion = None if (self.variant in {"single_relation_multitask", "single_relation_multitask_noalloc", "multitask_nograph"} or len(self.graph_types) == 1) else GraphFusionAttention(hidden_dim, self.graph_types)
         self.head = ProducerForecastHead(hidden_dim, int(config.horizon) * self.target_dim)
         self.forward_edge_types: Dict[str, tuple[str, str, str]] = {}
         self.edge_heads = nn.ModuleDict()
-        for graph_type in self.graph_types:
-            for edge_type in self.metadata.get("relation_groups", {}).get(graph_type, []):
-                if edge_type[0] == "injector" and edge_type[2] == "producer":
-                    self.forward_edge_types[graph_type] = edge_type
-                    self.edge_heads[graph_type] = EdgeAllocationHead(hidden_dim)
-                    break
+        if self.use_graph_message_passing and self.use_edge_allocation_head:
+            for graph_type in self.graph_types:
+                for edge_type in self.metadata.get("relation_groups", {}).get(graph_type, []):
+                    if edge_type[0] == "injector" and edge_type[2] == "producer":
+                        self.forward_edge_types[graph_type] = edge_type
+                        self.edge_heads[graph_type] = EdgeAllocationHead(hidden_dim)
+                        break
         self.latest_fusion_weights: torch.Tensor | None = None
+        self.latest_fusion_labels: List[str] = list(self.graph_types) if self.graph_types else ["no_graph"]
         self.latest_edge_allocations: Dict[str, torch.Tensor] = {}
         self.latest_allocation_history: Dict[str, torch.Tensor] = {}
 
@@ -311,6 +323,35 @@ class STGNNPyG(nn.Module):
         return weights, context
 
     def forward(self, history: List[Any]) -> tuple[torch.Tensor, Dict[str, Any]]:
+        if not self.use_graph_message_passing:
+            producer_steps = []
+            for snapshot in history:
+                producer_x = snapshot["producer"].x
+                producer_steps.append(F.relu(self.producer_input_proj(producer_x)))
+            producer_seq = torch.stack(producer_steps, dim=1)
+            producer_emb = self.producer_temporal(producer_seq)
+            fused = {"producer": producer_emb}
+            fusion_weights = torch.ones((1,), device=producer_emb.device, dtype=producer_emb.dtype)
+            self.latest_fusion_labels = ["no_graph"]
+            self.latest_fusion_weights = fusion_weights.detach()
+            pred = self.head(fused["producer"])
+            if self.target_dim > 1:
+                pred = pred.view(pred.size(0), int(self.config.horizon), self.target_dim)
+            producer_batch = getattr(history[-1]["producer"], "batch", None)
+            pred = _split_by_batch(pred, producer_batch)
+            self.latest_edge_allocations = {}
+            self.latest_allocation_history = {}
+            diagnostics = {
+                "fusion_weights": fusion_weights,
+                "branch_embeddings": {"no_graph": {"producer": producer_emb}},
+                "fused_embeddings": fused,
+                "edge_allocations": {},
+                "allocation_history": {},
+                "edge_context": {},
+                "producer_batch": producer_batch,
+            }
+            return pred, diagnostics
+
         branch_sequences: Dict[str, Dict[str, List[torch.Tensor]]] = {
             graph_type: {node_type: [] for node_type in self.node_types}
             for graph_type in self.graph_types
@@ -343,8 +384,10 @@ class STGNNPyG(nn.Module):
             graph_type = self.graph_types[0]
             fused = branch_embeddings[graph_type]
             fusion_weights = torch.ones((1,), device=fused["producer"].device, dtype=fused["producer"].dtype)
+            self.latest_fusion_labels = [graph_type]
         else:
             fused, fusion_weights = self.fusion(branch_embeddings)
+            self.latest_fusion_labels = list(self.graph_types)
         self.latest_fusion_weights = fusion_weights.detach()
         pred = self.head(fused["producer"])
         if self.target_dim > 1:
@@ -367,6 +410,7 @@ class STGNNPyG(nn.Module):
             "edge_allocations": edge_allocations,
             "allocation_history": allocation_history,
             "branch_embeddings": branch_embeddings,
+            "fused_embeddings": fused,
             "edge_context": edge_context,
             "producer_batch": producer_batch,
         }

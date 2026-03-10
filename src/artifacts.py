@@ -391,7 +391,7 @@ def parse_args() -> argparse.Namespace:
         "--stgnn-variant",
         type=str,
         default=None,
-        choices=["single_relation_multitask", "legacy_multigraph"],
+        choices=["single_relation_multitask", "single_relation_multitask_noalloc", "multitask_nograph", "legacy_multigraph"],
         help="STGNN PyG architecture variant",
     )
     parser.add_argument(

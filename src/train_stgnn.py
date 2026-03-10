@@ -160,7 +160,22 @@ def _select_loss(name: str) -> nn.Module:
 
 
 def _is_single_relation_multitask(config: Any) -> bool:
-    return str(getattr(config, "stgnn_variant", "legacy_multigraph")).strip().lower() == "single_relation_multitask"
+    if hasattr(config, "is_multitask_stgnn_variant"):
+        return bool(config.is_multitask_stgnn_variant())
+    return str(getattr(config, "stgnn_variant", "legacy_multigraph")).strip().lower() in {
+        "single_relation_multitask",
+        "single_relation_multitask_noalloc",
+        "multitask_nograph",
+    }
+
+
+def _uses_edge_allocation_head(config: Any) -> bool:
+    if hasattr(config, "uses_edge_allocation_head"):
+        return bool(config.uses_edge_allocation_head())
+    return str(getattr(config, "stgnn_variant", "legacy_multigraph")).strip().lower() in {
+        "single_relation_multitask",
+        "legacy_multigraph",
+    }
 
 
 def _compute_target_scaler(samples: List[Dict[str, Any]], target_names: List[str]) -> Dict[str, Any]:
@@ -626,11 +641,47 @@ def _tensor_channel_ranges(values: Optional[torch.Tensor], target_names: List[st
     return result
 
 
+def _prediction_diversity_summary(pred: torch.Tensor, target_names: List[str]) -> Dict[str, Any]:
+    arr = pred.detach().float().cpu()
+    if arr.dim() == 2:
+        arr = arr.unsqueeze(-1)
+    summary: Dict[str, Any] = {}
+    for idx, target_name in enumerate(target_names):
+        channel = arr[..., idx]
+        rounded = torch.round(channel * 1_000_000.0) / 1_000_000.0
+        unique_sequences = torch.unique(rounded, dim=0).size(0) if rounded.dim() == 2 else int(rounded.numel() > 0)
+        horizon_std = channel.std(dim=0, unbiased=False) if channel.dim() == 2 else channel.new_zeros((1,))
+        summary[target_name] = {
+            "unique_sequences": int(unique_sequences),
+            "cross_well_std_by_horizon": [float(value.item()) for value in horizon_std],
+            "global_std": float(channel.std(unbiased=False).item()) if channel.numel() else 0.0,
+        }
+    return summary
+
+
+def _embedding_diversity_summary(fused_embeddings: Optional[Dict[str, torch.Tensor]]) -> Optional[Dict[str, Dict[str, float]]]:
+    if not fused_embeddings:
+        return None
+    summary: Dict[str, Dict[str, float]] = {}
+    for node_type, values in fused_embeddings.items():
+        tensor = values.detach().float().cpu()
+        if tensor.numel() == 0:
+            continue
+        per_feature_std = tensor.std(dim=0, unbiased=False)
+        summary[node_type] = {
+            "mean_feature_std": float(per_feature_std.mean().item()),
+            "max_feature_std": float(per_feature_std.max().item()),
+            "global_std": float(tensor.std(unbiased=False).item()),
+        }
+    return summary or None
+
+
 def _fusion_weights_frame(model: STGNNPyG) -> pd.DataFrame:
     if model.latest_fusion_weights is None:
         return pd.DataFrame(columns=["graph_type", "weight"])
     weights = model.latest_fusion_weights.detach().float().cpu().numpy()
-    return pd.DataFrame({"graph_type": model.graph_types, "weight": weights})
+    labels = list(getattr(model, "latest_fusion_labels", None) or model.graph_types)
+    return pd.DataFrame({"graph_type": labels, "weight": weights})
 
 
 def _edge_allocations_frame(model: STGNNPyG, multigraph_spec: Dict[str, Any]) -> pd.DataFrame:
@@ -763,10 +814,9 @@ def fit_and_forecast_stgnn(
     if runtime.is_main:
         logger.info("STGNN init: lazy-parameter warmup complete")
 
-    # The single-relation multitask path keeps diagnostics-only modules
-    # (edge allocation heads, injector temporal branch) that do not
+    # Some multitask variants keep diagnostics-only modules that do not
     # participate in the data-only loss on every step.
-    find_unused_parameters = bool(_is_single_relation_multitask(config))
+    find_unused_parameters = bool(_is_single_relation_multitask(config) and _uses_edge_allocation_head(config))
     if runtime.enabled:
         if runtime.is_main:
             logger.info("STGNN init: wrapping model with DistributedDataParallel")
@@ -891,13 +941,14 @@ def fit_and_forecast_stgnn(
         if best_state is not None:
             _unwrap_model(model).load_state_dict(best_state)
         model.eval()
+        plain_model = _unwrap_model(model)
         with torch.no_grad():
             test_batch = next(iter(test_loader))
             _, _, pred = _compute_batch_loss(model, test_batch, loss_fn, multigraph_spec, frames, config, device, epoch=0, target_scaler=target_scaler)
+            _, diagnostics = plain_model(_history_to_device(test_batch["history"], device))
         pred = pred.squeeze(0)
         pred_scaled = _standardize_targets(pred, target_scaler, device) if target_scaler is not None else None
         pred_inverse = _inverse_standardize_targets(pred_scaled, target_scaler, device) if pred_scaled is not None else None
-        plain_model = _unwrap_model(model)
         pred_df = _prediction_frame(
             pred,
             test_sample["forecast_dates"],
@@ -947,6 +998,8 @@ def fit_and_forecast_stgnn(
                 "standardized_prediction_ranges": _tensor_channel_ranges(pred_scaled, target_names),
                 "inverse_prediction_ranges": _tensor_channel_ranges(pred_inverse, target_names),
             }
+            training_summary["prediction_diversity"] = _prediction_diversity_summary(pred, target_names)
+            training_summary["embedding_diversity"] = _embedding_diversity_summary(diagnostics.get("fused_embeddings"))
             logger.info(
                 "STGNN scale audit: model outputs raw units, loss uses standardized targets, max_inverse_reconstruction_abs_error=%.6g",
                 inverse_err,

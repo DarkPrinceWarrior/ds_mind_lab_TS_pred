@@ -140,7 +140,7 @@ class PipelineConfig:
 
     # Model selection
     model_type: str = "chronos2"  # "chronos2", "xlinear", "stgnn_pyg"
-    stgnn_variant: str = "single_relation_multitask"  # "single_relation_multitask", "legacy_multigraph"
+    stgnn_variant: str = "single_relation_multitask"  # "single_relation_multitask", "single_relation_multitask_noalloc", "multitask_nograph", "legacy_multigraph"
 
     # XLinear configuration (NeuralForecast)
     xlinear_hidden_size: int = 128
@@ -223,11 +223,23 @@ class PipelineConfig:
     def is_graph_model(self) -> bool:
         return str(self.model_type).strip().lower() == "stgnn_pyg"
 
+    def normalized_stgnn_variant(self) -> str:
+        return str(self.stgnn_variant).strip().lower()
+
+    def is_multitask_stgnn_variant(self) -> bool:
+        return self.normalized_stgnn_variant() in {"single_relation_multitask", "single_relation_multitask_noalloc", "multitask_nograph"}
+
     def is_single_relation_multitask(self) -> bool:
-        return str(self.stgnn_variant).strip().lower() == "single_relation_multitask"
+        return self.normalized_stgnn_variant() in {"single_relation_multitask", "single_relation_multitask_noalloc", "multitask_nograph"}
+
+    def uses_edge_allocation_head(self) -> bool:
+        return self.normalized_stgnn_variant() in {"single_relation_multitask", "legacy_multigraph"}
+
+    def uses_graph_message_passing(self) -> bool:
+        return self.normalized_stgnn_variant() != "multitask_nograph"
 
     def resolved_graph_types(self) -> List[str]:
-        if self.is_single_relation_multitask():
+        if self.is_multitask_stgnn_variant():
             return ["bin"]
         values = [str(item).strip().lower() for item in self.graph_types if str(item).strip()]
         return values or ["topo", "bin", "cond", "dyn", "causal"]
